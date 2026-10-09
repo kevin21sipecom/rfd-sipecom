@@ -11,12 +11,13 @@ from docx.text.paragraph import Paragraph
 
 EXTENSIONES = {".txt", ".md", ".docx", ".pptx", ".pdf"}
 MAX_CARACTERES = 120_000
-# Claude y los modelos de Codex en la nube admiten contextos mucho mayores que los locales (~4 caracteres por token).
+# Los modelos de las CLIs admiten contextos amplios (~4 caracteres por token); 120 000 queda para OpenCode.
 MAX_CARACTERES_CLAUDE = 450_000
 
 
 def limite_para(proveedor: str) -> int:
-    return MAX_CARACTERES_CLAUDE if proveedor in ("claude", "codex") else MAX_CARACTERES
+    # OpenCode puede usar modelos gratuitos de 200k tokens: se mantiene el límite conservador.
+    return MAX_CARACTERES if proveedor == "opencode" else MAX_CARACTERES_CLAUDE
 
 
 @dataclass(frozen=True)

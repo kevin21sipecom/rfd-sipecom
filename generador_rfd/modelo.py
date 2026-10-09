@@ -1,4 +1,4 @@
-"""Orquestación del modelo: Claude Code CLI o Codex CLI con un proveedor local.
+"""Orquestación del modelo: Claude Code, Codex, Antigravity (agy), Grok u OpenCode por su CLI.
 
 Dos fases: (1) análisis estructurado de cada fuente, en paralelo; (2) redacción del RFD a partir
 de los análisis, las fuentes completas, el sistema existente y las referencias de estilo.
@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .fuentes import Fuente
+from .motores import ADAPTADORES, PROVEEDORES
 from .schema import SCHEMA, SCHEMA_ANALISIS, validar_contra, validar_estructura
 
 SISTEMA_CLAUDE = (
@@ -77,7 +78,7 @@ def _sin_meta(esquema: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in esquema.items() if k != "$schema"}
 
 
-def comando_claude(ejecutable: str, modelo: str, esquema: dict[str, Any]) -> list[str]:
+def comando_claude(ejecutable: str, modelo: str, esquema: dict[str, Any], esfuerzo: str = "") -> list[str]:
     return [
         ejecutable, "-p", "--output-format", "json",
         "--json-schema", json.dumps(_sin_meta(esquema), ensure_ascii=False),
@@ -86,18 +87,15 @@ def comando_claude(ejecutable: str, modelo: str, esquema: dict[str, Any]) -> lis
         "--tools", "", "--strict-mcp-config", "--setting-sources", "",
         "--disable-slash-commands", "--no-session-persistence",
         "--system-prompt", SISTEMA_CLAUDE,
-    ]
+    ] + (["--effort", esfuerzo.strip()] if esfuerzo.strip() else [])
 
 
-def comando_codex(ejecutable: str, proveedor: str, modelo: str, esfuerzo: str, trabajo: Path,
-                  esquema: Path, respuesta: Path) -> list[str]:
+def comando_codex(ejecutable: str, modelo: str, esfuerzo: str, trabajo: Path, esquema: Path, respuesta: Path) -> list[str]:
     """Codex CLI aislado: sólo lectura, sin config.toml ni reglas del usuario, sesión efímera y eventos JSON."""
     comando = [ejecutable, "exec"]
-    if proveedor in ("ollama", "lmstudio"):
-        comando += ["--oss", "--local-provider", proveedor]
     if modelo.strip():
         comando += ["--model", modelo.strip()]
-    if esfuerzo.strip() and proveedor == "codex":
+    if esfuerzo.strip():
         comando += ["-c", f'model_reasoning_effort="{esfuerzo.strip()}"']
     return comando + [
         "--sandbox", "read-only", "--ephemeral", "--ignore-user-config", "--ignore-rules",
@@ -106,7 +104,8 @@ def comando_codex(ejecutable: str, proveedor: str, modelo: str, esfuerzo: str, t
     ]
 
 
-def _invocar_claude(prompt: str, esquema: dict[str, Any], modelo: str, directorio: Path, tiempo: int, uso: Uso | None) -> Any:
+def _invocar_claude(prompt: str, esquema: dict[str, Any], modelo: str, directorio: Path, tiempo: int, uso: Uso | None,
+                    esfuerzo: str = "") -> Any:
     ejecutable = shutil.which("claude")
     if not ejecutable:
         raise RuntimeError("No se encontró Claude Code CLI (claude) en PATH.")
@@ -114,7 +113,7 @@ def _invocar_claude(prompt: str, esquema: dict[str, Any], modelo: str, directori
     with tempfile.TemporaryDirectory(prefix="rfd-claude-", dir=directorio) as temporal:
         try:
             proceso = subprocess.run(
-                comando_claude(ejecutable, modelo, esquema), input=prompt, text=True, encoding="utf-8",
+                comando_claude(ejecutable, modelo, esquema, esfuerzo), input=prompt, text=True, encoding="utf-8",
                 errors="replace", capture_output=True, timeout=tiempo, check=False, cwd=temporal,
             )
         except subprocess.TimeoutExpired as e:
@@ -164,19 +163,17 @@ def eventos_codex(salida: str) -> tuple[dict[str, int], str]:
     return tokens, error
 
 
-def _invocar_codex(prompt: str, esquema: dict[str, Any], proveedor: str, modelo: str, esfuerzo: str,
+def _invocar_codex(prompt: str, esquema: dict[str, Any], modelo: str, esfuerzo: str,
                    directorio: Path, tiempo: int, uso: Uso | None) -> Any:
     ejecutable = shutil.which("codex")
     if not ejecutable:
         raise RuntimeError("No se encontró Codex CLI en PATH.")
-    if proveedor != "codex" and not modelo.strip():
-        raise ValueError("Indique el modelo cargado en el proveedor local.")
     directorio.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="rfd-codex-", dir=directorio) as temporal:
         trabajo = Path(temporal)
         schema_path, salida_path = trabajo / "esquema.json", trabajo / "respuesta.json"
         schema_path.write_text(json.dumps(_sin_meta(esquema), ensure_ascii=False, indent=2), encoding="utf-8")
-        comando = comando_codex(ejecutable, proveedor, modelo, esfuerzo, trabajo, schema_path, salida_path)
+        comando = comando_codex(ejecutable, modelo, esfuerzo, trabajo, schema_path, salida_path)
         try:
             proceso = subprocess.run(comando, input=prompt, text=True, encoding="utf-8", errors="replace",
                                      capture_output=True, timeout=tiempo, check=False)
@@ -192,23 +189,22 @@ def _invocar_codex(prompt: str, esquema: dict[str, Any], proveedor: str, modelo:
             raise RuntimeError(f"Codex CLI devolvió JSON inválido: {e}") from e
     if uso is not None:
         etiqueta = modelo.strip() or "codex (por defecto)"
-        if esfuerzo.strip() and proveedor == "codex":
+        if esfuerzo.strip():
             etiqueta += f" · {esfuerzo.strip()}"
         uso.registrar([etiqueta], None, tokens.get("input_tokens", 0),
                       tokens.get("output_tokens", 0) + tokens.get("reasoning_output_tokens", 0))
     return datos
 
 
-PROVEEDORES = ("claude", "codex", "ollama", "lmstudio")
-
-
 def invocar(*, proveedor: str, modelo: str, prompt: str, esquema: dict[str, Any], directorio: Path,
             tiempo: int = 900, uso: Uso | None = None, esfuerzo: str = "") -> Any:
     if proveedor == "claude":
-        return _invocar_claude(prompt, esquema, modelo, directorio, tiempo, uso)
-    if proveedor not in PROVEEDORES:
-        raise ValueError("Proveedor no admitido; use " + ", ".join(PROVEEDORES) + ".")
-    return _invocar_codex(prompt, esquema, proveedor, modelo, esfuerzo, directorio, tiempo, uso)
+        return _invocar_claude(prompt, esquema, modelo, directorio, tiempo, uso, esfuerzo)
+    if proveedor == "codex":
+        return _invocar_codex(prompt, esquema, modelo, esfuerzo, directorio, tiempo, uso)
+    if proveedor not in ADAPTADORES:
+        raise ValueError("CLI no admitida; use " + ", ".join(PROVEEDORES) + ".")
+    return ADAPTADORES[proveedor](prompt, esquema, modelo, esfuerzo, directorio, tiempo, uso, SISTEMA_CLAUDE)
 
 
 def modelos_codex(tiempo: int = 30) -> list[dict[str, Any]]:
@@ -283,7 +279,7 @@ def analizar_fuentes(
         validar_contra(datos, SCHEMA_ANALISIS, f"análisis de {f.nombre}")
         return datos
 
-    with ThreadPoolExecutor(max_workers=max(1, paralelo if proveedor in ("claude", "codex") else 1)) as ejecutor:
+    with ThreadPoolExecutor(max_workers=max(1, paralelo)) as ejecutor:
         futuros = {ejecutor.submit(uno, f): f for f in pendientes}
         for futuro in as_completed(futuros):
             f = futuros[futuro]

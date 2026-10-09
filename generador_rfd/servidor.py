@@ -6,12 +6,10 @@ import json
 import mimetypes
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
 import time
-import urllib.request
 import uuid
 import webbrowser
 from datetime import date
@@ -24,7 +22,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .fuentes import EXTENSIONES
-from .modelo import MODELO_CLAUDE_DEFECTO, MODELOS_CLAUDE, modelos_codex
+from .modelo import MODELO_CLAUDE_DEFECTO
+from .motores import CLIS, catalogo, ejecutable
 from .almacen import Almacen
 from .modelo import Uso, generar_preguntas
 from .pipeline import PLANTILLA, RAIZ, Opciones, OpcionesMejora, Resultado, generar as generar_rfd, mejorar, publicar
@@ -39,7 +38,6 @@ mimetypes.add_type("text/css", ".css")
 PUERTO = 2122
 ESTATICOS = Path(__file__).resolve().parent / "static"
 SALIDAS = RAIZ / "salidas"
-URL_PROVEEDOR = {"ollama": "http://127.0.0.1:11434/api/tags", "lmstudio": "http://127.0.0.1:1234/v1/models"}
 
 app = FastAPI(title="Generador de RFD SIPECOM")
 TIPOS_WEB = {".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8"}
@@ -132,8 +130,8 @@ def _trabajo(id_: str, o: Opciones) -> None:
 def entorno() -> dict[str, Any]:
     h = herramientas()
     return {
-        "claude": shutil.which("claude"),
-        "codex": shutil.which("codex"),
+        "clis": [{"id": c.id, "nombre": c.nombre, "proveedor": c.proveedor, "reglas": c.reglas, "costo": c.costo,
+                  "ruta": ejecutable(c.id)} for c in CLIS.values()],
         "codegraph": h["codegraph"],
         "repomix": h["repomix"],
         "plantilla": PLANTILLA.is_file(),
@@ -144,39 +142,23 @@ def entorno() -> dict[str, Any]:
     }
 
 
-_cache_codex: dict[str, Any] = {}
-
-
-def _catalogo_codex() -> list[dict[str, Any]]:
-    """`codex debug models` tarda unos segundos: se reutiliza durante 10 minutos."""
-    if _cache_codex.get("hasta", 0) < time.time():
-        _cache_codex.update(modelos=modelos_codex(), hasta=time.time() + 600)
-    return _cache_codex["modelos"]
+_cache_modelos: dict[str, dict[str, Any]] = {}
+_candado_modelos = threading.Lock()
 
 
 @app.get("/api/modelos")
-def modelos(proveedor: str) -> dict[str, Any]:
-    if proveedor == "claude":
-        return {"disponible": bool(shutil.which("claude")), "defecto": MODELO_CLAUDE_DEFECTO, "modelos": MODELOS_CLAUDE}
-    if proveedor == "codex":
-        try:
-            lista = _catalogo_codex()
-        except RuntimeError as e:
-            return {"disponible": False, "defecto": "", "modelos": [], "detalle": str(e)}
-        return {"disponible": True, "defecto": lista[0]["id"] if lista else "", "modelos": lista}
-    url = URL_PROVEEDOR.get(proveedor)
-    if not url:
-        raise HTTPException(400, "Proveedor no admitido.")
-    try:
-        with urllib.request.urlopen(url, timeout=2) as r:
-            carga = json.load(r)
-        nombres = [x.get("name", x.get("id", "")) for x in carga.get("models", carga.get("data", []))]
-        return {
-            "disponible": True, "defecto": nombres[0] if nombres else "",
-            "modelos": [{"id": n, "nombre": n, "detalle": f"Modelo cargado en {proveedor}"} for n in nombres],
-        }
-    except (OSError, ValueError):
-        return {"disponible": False, "defecto": "", "modelos": [], "detalle": f"Sin respuesta en {url}"}
+def modelos(proveedor: str, refrescar: bool = False) -> dict[str, Any]:
+    """Listado vivo de cada CLI (`codex debug models`, `agy models`, `grok models`, `opencode models`).
+    Se guarda 10 minutos; un catálogo no disponible se vuelve a consultar al minuto."""
+    if proveedor not in CLIS:
+        raise HTTPException(400, "CLI no admitida.")
+    with _candado_modelos:
+        previo = _cache_modelos.get(proveedor)
+        if refrescar or not previo or previo["hasta"] < time.time():
+            datos = catalogo(proveedor)
+            previo = _cache_modelos[proveedor] = {"datos": datos, "hasta": time.time() + (600 if datos["disponible"] else 60)}
+    c = CLIS[proveedor]
+    return {**previo["datos"], "cli": {"id": c.id, "nombre": c.nombre, "proveedor": c.proveedor, "reglas": c.reglas, "costo": c.costo}}
 
 
 @app.get("/api/elegir-carpeta")
@@ -243,7 +225,7 @@ async def generar(
         cliente=cliente.strip(), codigo=codigo.strip(), tipo_proyecto=tipo_proyecto,
         titulo=titulo.strip() or None, fecha=fecha.strip() or date.today().strftime("%d/%m/%Y"),
         proveedor=proveedor, modelo=modelo.strip() or (MODELO_CLAUDE_DEFECTO if proveedor == "claude" else ""),
-        esfuerzo=esfuerzo.strip() if proveedor == "codex" else "",
+        esfuerzo=esfuerzo.strip(),
         proyecto=Path(proyecto.strip()) if proyecto.strip() else None, enfoque=enfoque.strip(),
         publico=publico, revisar_word=revisar_word, reglas=almacen().reglas_para(cliente),
         salida=SALIDAS / f"RFD_{_nombre_seguro(codigo.strip()).replace(' ', '_')}.docx",
@@ -440,7 +422,7 @@ async def mejorar_rfd(
     o = OpcionesMejora(
         base=Path(base["ruta_docx"] or SALIDAS / f"RFD_{_nombre_seguro(base['codigo'])}.docx"), salida_dir=SALIDAS,
         respuestas=respuestas, adjuntos=rutas, proveedor=proveedor, modelo=_modelo_de(proveedor, modelo),
-        esfuerzo=esfuerzo.strip() if proveedor == "codex" else "", revisar_word=revisar_word,
+        esfuerzo=esfuerzo.strip(), revisar_word=revisar_word,
         datos_base=base["datos"], analisis_base=base["analisis"], reglas=almacen().reglas_para(base["cliente"]),
     )
 
@@ -469,7 +451,7 @@ def crear_preguntas(rfd_id: int, proveedor: str = Form("claude"), modelo: str = 
             uso = Uso()
             preguntas = generar_preguntas(datos=base["datos"], analisis=base["analisis"], proveedor=proveedor,
                                           modelo=_modelo_de(proveedor, modelo), directorio_salida=SALIDAS, uso=uso,
-                                          esfuerzo=esfuerzo if proveedor == "codex" else "",
+                                          esfuerzo=esfuerzo.strip(),
                                           reglas=bloque_prompt(almacen().reglas_para(base["cliente"])))
             datos = {**base["datos"], "preguntas_cliente": preguntas}
             docx = Path(base["ruta_docx"])

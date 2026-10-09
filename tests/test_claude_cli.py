@@ -137,14 +137,11 @@ def test_inventario_de_varios_repositorios(tmp_path):
 def test_comando_codex_aislado_y_eventos(tmp_path):
     from generador_rfd.modelo import comando_codex, eventos_codex
 
-    nube = comando_codex("codex", "codex", "gpt-6-luna", "low", tmp_path, tmp_path / "e.json", tmp_path / "r.json")
+    nube = comando_codex("codex", "gpt-6-luna", "low", tmp_path, tmp_path / "e.json", tmp_path / "r.json")
     for opcion in ("--ephemeral", "--ignore-user-config", "--ignore-rules", "--json", "--output-schema"):
         assert opcion in nube
     assert nube[nube.index("--sandbox") + 1] == "read-only"
     assert 'model_reasoning_effort="low"' in nube and "--oss" not in nube
-    local = comando_codex("codex", "ollama", "llama", "high", tmp_path, tmp_path / "e.json", tmp_path / "r.json")
-    assert local[local.index("--local-provider") + 1] == "ollama"
-    assert not any("model_reasoning_effort" in x for x in local), "el esfuerzo sólo aplica a Codex en la nube"
     tokens, error = eventos_codex("\n".join([
         '{"type":"thread.started"}', "texto no JSON",
         '{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":7,"reasoning_output_tokens":3}}',
@@ -362,6 +359,87 @@ def test_reglas_predeterminadas_del_documento_de_correcciones(tmp_path):
     datos["anexos"] = []
     sin_anexos = publicar(datos, tmp_path / "sin_anexos.docx")
     assert "Capítulo 8" not in texto_docx(sin_anexos.salida) and "Capítulo 7" in texto_docx(sin_anexos.salida)
+
+
+def test_adaptadores_agy_grok_opencode(tmp_path, monkeypatch):
+    import subprocess as sp
+
+    from generador_rfd import motores
+    from generador_rfd.modelo import Uso, invocar
+
+    llamadas: list[dict] = []
+    salidas = {
+        "agy": "\n".join([
+            '{"event":"init","init":{"model":"gemini-3.8-flash-low"}}',
+            '{"event":"result","result":{"status":"SUCCESS","response":"","structured_output":{"ok":true},'
+            '"usage":{"input_tokens":120,"output_tokens":8,"thinking_tokens":2}}}',
+        ]),
+        "grok": '{"structured_output":{"ok":true},"usage":{"input_tokens":50,"output_tokens":4},"total_cost_usd":0.01}',
+        "opencode": "\n".join([
+            '{"type":"step_start","part":{}}',
+            '{"type":"text","part":{"type":"text","text":"```json\\n{\\"ok\\": "}}',
+            '{"type":"text","part":{"type":"text","text":"true}\\n```"}}',
+            '{"type":"step_finish","part":{"tokens":{"input":30,"output":5,"reasoning":1,"cache":{"read":10}},"cost":0}}',
+        ]),
+    }
+
+    def correr_falso(comando, *, entrada=None, tiempo, cwd=None, env=None):
+        cli = Path(comando[0]).name
+        llamadas.append({"cli": cli, "comando": comando, "entrada": entrada, "env": env or {},
+                         "prompt_file": Path(comando[comando.index("--prompt-file") + 1]).read_text(encoding="utf-8")
+                         if "--prompt-file" in comando else None})
+        return sp.CompletedProcess(comando, 0, salidas[cli], "")
+
+    monkeypatch.setattr(motores, "ejecutable", lambda cli: cli)
+    monkeypatch.setattr(motores, "_correr", correr_falso)
+    esquema = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}
+    uso = Uso()
+    for cli, modelo, esfuerzo in [("agy", "gemini-3.8-flash-low", "high"), ("grok", "grok-4.7", "low"), ("opencode", "opencode/big-pickle", "high")]:
+        assert invocar(proveedor=cli, modelo=modelo, prompt="PROMPT-RFD", esquema=esquema, directorio=tmp_path,
+                       uso=uso, esfuerzo=esfuerzo) == {"ok": True}
+    agy, grok, opencode = llamadas
+    # agy: -p no lee stdin; el prompt va como NDJSON por stream-json, con el esquema en un archivo.
+    assert agy["comando"][-1] == "-p=" and "--sandbox" in agy["comando"] and "--disable-slash-commands" in agy["comando"]
+    assert agy["comando"][agy["comando"].index("--input-format") + 1] == "stream-json"
+    assert agy["comando"][agy["comando"].index("--effort") + 1] == "high"
+    mensaje = json.loads(agy["entrada"])
+    assert mensaje["event"] == "user" and mensaje["message"]["role"] == "user" and "PROMPT-RFD" in mensaje["message"]["content"]
+    # grok: prompt por archivo, system prompt propio y sin subagentes ni web.
+    assert grok["prompt_file"] == "PROMPT-RFD"
+    for opcion in ("--system-prompt-override", "--no-subagents", "--disable-web-search", "--json-schema"):
+        assert opcion in grok["comando"]
+    # opencode: sin --json-schema, el esquema va en el prompt; se desactivan CLAUDE.md y la config del proyecto.
+    assert "--pure" in opencode["comando"] and opencode["comando"][opencode["comando"].index("--variant") + 1] == "high"
+    assert "FORMATO DE RESPUESTA" in opencode["entrada"] and '"required": ["ok"]' in opencode["entrada"]
+    assert opencode["env"]["OPENCODE_DISABLE_CLAUDE_CODE"] == "1" and opencode["env"]["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
+    assert uso.llamadas == 3 and uso.tokens_entrada == 120 + 50 + 40 and uso.costo_usd == pytest.approx(0.01)
+    with pytest.raises(ValueError, match="CLI no admitida"):
+        invocar(proveedor="ollama", modelo="x", prompt="p", esquema=esquema, directorio=tmp_path)
+
+
+def test_catalogos_de_modelos_por_cli(monkeypatch):
+    import subprocess as sp
+
+    from generador_rfd import motores
+
+    textos = {
+        "agy": ("Fetching available models...\ngemini-3.8-flash-high\tGemini 3.8 Flash (High)\nclaude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n", ""),
+        "grok": ("You are not authenticated.\n\nDefault model: grok-4.7\n\nAvailable models:\n  * grok-4.7 (default)\n", ""),
+        "opencode": ('opencode/big-pickle\n{"name": "Big Pickle", "limit": {"context": 200000}, "cost": {"input": 0, "output": 0}, "variants": {}}\n'
+                     'opencode/exo-free\n{"name": "Exo Free", "limit": {"context": 1048576}, "variants": {"high": {"reasoningEffort": "high"}}}\n', ""),
+    }
+    monkeypatch.setattr(motores, "ejecutable", lambda cli: cli)
+    monkeypatch.setattr(motores, "_correr", lambda comando, **_: sp.CompletedProcess(comando, 0, *textos[Path(comando[0]).name]))
+    agy = motores.catalogo("agy")
+    assert agy["disponible"] and [m["id"] for m in agy["modelos"]] == ["gemini-3.8-flash-high", "claude-sonnet-4-6"]
+    grok = motores.catalogo("grok")
+    assert not grok["disponible"] and "grok login" in grok["detalle"]
+    oc = motores.catalogo("opencode")
+    assert [(m["id"], m["nombre"], m["niveles"]) for m in oc["modelos"]] == [
+        ("opencode/big-pickle", "Big Pickle", []), ("opencode/exo-free", "Exo Free", ["high"])]
+    assert "200k de contexto" in oc["modelos"][0]["detalle"]
+    monkeypatch.setattr(motores, "ejecutable", lambda cli: None)
+    assert "no está instalado" in motores.catalogo("grok")["detalle"]
 
 
 requiere_codex = pytest.mark.skipif(not shutil.which("codex"), reason="Codex CLI no está en PATH")

@@ -7,7 +7,7 @@
 ![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-historial-003B57?logo=sqlite&logoColor=white)
-![Motores](https://img.shields.io/badge/motores-Claude%20CLI%20%7C%20Codex%20CLI%20%7C%20Ollama%20%7C%20LM%20Studio-6B5BFF)
+![CLIs](https://img.shields.io/badge/CLIs-Claude%20%7C%20Codex%20%7C%20Antigravity%20%7C%20Grok%20%7C%20OpenCode-6B5BFF)
 
 ---
 
@@ -45,7 +45,7 @@ Redactar un RFD a partir de varias especificaciones, actas y del sistema actual 
 | **Entradas** | `.txt`, `.md`, `.docx`, `.pptx` (texto, tablas y notas) y `.pdf` (texto por página). Varias transcripciones y documentos de contexto; la transcripción es opcional. |
 | **Referencias de estilo** | RFD aprobados de otros proyectos que sólo orientan estructura y redacción; la revisión avisa si se filtran nombres o datos. |
 | **Código existente** | Inventario de una carpeta con varios repositorios (stack, controladores, componentes, servicios, procedimientos almacenados) y código relacionado vía **CodeGraph** o **Repomix**. |
-| **Motores** | Claude Code CLI (Sonnet, Opus, Fable, Haiku), Codex CLI (catálogo y nivel de razonamiento) y modelos locales de Ollama o LM Studio. Informa tokens y costo. |
+| **CLIs de IA** | Claude Code, Codex, Antigravity (`agy`), Grok y OpenCode, con el listado vivo de modelos de cada CLI y su nivel de esfuerzo. Cada una se aísla de sus propias reglas e instrucciones globales. Informa tokens y, cuando la CLI lo entrega, costo. |
 | **Calidad** | Rúbrica calibrada con un RFD aprobado y corrección editorial automática hasta alcanzar el umbral. |
 | **Reglas del equipo** | Instrucciones «evitar / exigir» por sección y cliente, inyectadas al modelo y verificadas en el resultado. |
 | **Word** | Plantilla SIPECOM, numeración por capítulo, índice actualizado y PDF con Microsoft Word, detección de páginas vacías y de instrucciones de plantilla sin reemplazar. |
@@ -90,9 +90,7 @@ flowchart LR
 ## Requisitos
 
 - **Python 3.11 o superior.**
-- Al menos un motor con sesión iniciada:
-  - [Claude Code](https://docs.claude.com/en/docs/claude-code) (`claude`, luego `/login`), **o**
-  - Codex CLI (`codex login`), que también permite modelos locales con Ollama o LM Studio.
+- Al menos una CLI de IA con sesión iniciada: [Claude Code](https://docs.claude.com/en/docs/claude-code) (`claude`, luego `/login`), Codex (`codex login`), Antigravity (`agy`), Grok (`grok login`) u OpenCode (`opencode`).
 - Opcional: **Microsoft Word** (Windows) para actualizar el índice y exportar PDF.
 - Opcional: **CodeGraph** (`npm i -g @colbymchenry/codegraph`) o **Repomix** para analizar el código existente.
 - Opcional: **Bun** o Node, sólo para modificar la interfaz web.
@@ -126,7 +124,7 @@ make dev              # http://127.0.0.1:2122 y abre el navegador
 1. **Fuentes:** arrastre actas, especificaciones o presentaciones (y, si quiere, un RFD de referencia de estilo).
 2. **Código del proyecto** (opcional): elija la carpeta de los repositorios y revise el contexto que se aportará.
 3. **Datos del RFD:** cliente, código, título, fecha y tipo de proyecto.
-4. **Motor:** Claude, Codex o un modelo local; modelo y nivel de razonamiento.
+4. **Motor:** CLI, modelo (listado vivo de esa CLI, con «Otro modelo…» para un ID manual) y esfuerzo. La elección se recuerda por CLI.
 5. **Generar RFD:** siga el progreso por pasos y descargue el Word, el PDF, el cuestionario y el informe de revisión.
 
 `Ver demostración sin modelo` genera un RFD ficticio para comprobar el formato.
@@ -144,6 +142,20 @@ make dev              # http://127.0.0.1:2122 y abre el navegador
 | `make test` / `make test-fast` | Pruebas completas / sin llamar a modelos |
 | `make demo` | RFD de demostración |
 | `make clean` | Cachés y temporales |
+
+## CLIs de IA
+
+Cada CLI recibe el prompt, entrega la salida estructurada y carga reglas propias de forma distinta; `generador_rfd/motores.py` concentra esas diferencias, siguiendo el contrato de `@sipecom/common-utils` (`agent-cli.ts`).
+
+| CLI | Catálogo de modelos | Prompt | Salida estructurada | Aislamiento de sus reglas |
+| --- | --- | --- | --- | --- |
+| `claude` | catálogo de la app | stdin | `--json-schema` | sin herramientas, MCP, plugins ni settings (CLAUDE.md fuera); `--system-prompt` |
+| `codex` | `codex debug models` | stdin | `--output-schema` | sólo lectura, efímero, `--ignore-user-config`, `--ignore-rules` |
+| `agy` | `agy models` | stdin como NDJSON (`--input-format stream-json`) | `--json-schema` | `--sandbox`, `--disable-slash-commands`, carpeta vacía |
+| `grok` | `grok models` | `--prompt-file` | `--json-schema` | `--system-prompt-override`, sin subagentes, plan ni web |
+| `opencode` | `opencode models --verbose` | stdin | esquema en el prompt + validación | `--pure` y `OPENCODE_DISABLE_*` (CLAUDE.md, skills, config del proyecto) |
+
+El esfuerzo se pasa como `--effort` (claude, agy), `model_reasoning_effort` (codex), `--reasoning-effort` (grok) o `--variant` (opencode). `generador-rfd doctor --proveedor <cli>` muestra la ruta, el aislamiento y el catálogo de cada una.
 
 ## Cómo se genera un RFD
 

@@ -4,19 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import subprocess
 import sys
-import urllib.error
-import urllib.request
 from datetime import date
 from pathlib import Path
 
-from .modelo import MODELO_CLAUDE_DEFECTO, MODELOS_CLAUDE, modelos_codex
+from .modelo import MODELO_CLAUDE_DEFECTO, MODELOS_CLAUDE
+from .motores import CLIS, catalogo, ejecutable
 from .pipeline import LINEAMIENTOS, PLANTILLA, RAIZ, Opciones, Resultado, generar, publicar
 from .proyecto import herramientas
 
-PROVEEDORES = ["claude", "codex", "ollama", "lmstudio"]
+PROVEEDORES = list(CLIS)
 
 
 def _mostrar(r: Resultado) -> None:
@@ -31,66 +29,45 @@ def _mostrar(r: Resultado) -> None:
 
 
 def _doctor(proveedor: str, modelo: str | None) -> None:
-    print(f"Claude CLI: {shutil.which('claude') or 'NO ENCONTRADO'}")
-    print(f"Codex CLI: {shutil.which('codex') or 'NO ENCONTRADO (necesario para codex, ollama y lmstudio)'}")
+    """Comprobaciones headless, como el ToolDoctor de common-ts: ejecutable, sesión (Codex) y catálogo de modelos."""
+    sys.stdout.reconfigure(encoding="utf-8")
+    for c in CLIS.values():
+        print(f"{c.nombre:<12} ({c.id}): {ejecutable(c.id) or 'NO ENCONTRADO'}")
     print(f"Plantilla: {'OK' if PLANTILLA.is_file() else 'NO ENCONTRADA'} ({PLANTILLA})")
     print(f"Lineamientos: {'OK' if LINEAMIENTOS.is_file() else 'NO ENCONTRADOS'}")
     for nombre, ruta in herramientas().items():
         print(f"{nombre}: {ruta or 'no instalado (opcional, para --proyecto)'}")
-    if proveedor == "claude":
-        print("Modelos Claude (use --modelo):")
-        for m in MODELOS_CLAUDE:
-            marca = " (por defecto)" if m["id"] == MODELO_CLAUDE_DEFECTO else ""
-            print(f"  {m['id']:<28} {m['nombre']} - {m['etiqueta']}{marca}")
+    if proveedor == "codex" and ejecutable("codex"):
+        for etiqueta, args in [("versión", ["--version"]), ("sesión", ["login", "status"])]:
+            try:
+                p = subprocess.run([ejecutable("codex") or "codex", *args], capture_output=True, text=True, encoding="utf-8",
+                                   errors="replace", timeout=20, check=False, stdin=subprocess.DEVNULL)
+                linea = next((x.strip() for x in ((p.stdout or "") + (p.stderr or "")).splitlines() if x.strip()), "sin respuesta")
+            except subprocess.TimeoutExpired:
+                linea = "no respondió (puede requerir una sesión interactiva)"
+            print(f"Codex {etiqueta}: {linea}")
+    c = CLIS[proveedor]
+    print(f"\n{c.nombre}: {c.reglas}")
+    datos = catalogo(proveedor)
+    if not datos["disponible"]:
+        print(f"Modelos: {datos.get('detalle')}")
         return
-    if proveedor == "codex":
-        _doctor_codex()
-        return
-    url = "http://127.0.0.1:11434/api/tags" if proveedor == "ollama" else "http://127.0.0.1:1234/v1/models"
-    try:
-        with urllib.request.urlopen(url, timeout=2) as respuesta:
-            carga = json.load(respuesta)
-        lista = carga.get("models", carga.get("data", []))
-        nombres = [x.get("name", x.get("id", "")) for x in lista]
-        print(f"Proveedor {proveedor}: disponible en {url}")
-        print("Modelos: " + (", ".join(nombres) if nombres else "ninguno informado"))
-        if modelo and modelo not in nombres:
-            print(f"Aviso: el modelo '{modelo}' no figura en la lista del proveedor.")
-    except (OSError, ValueError, urllib.error.URLError):
-        print(f"Proveedor {proveedor}: sin respuesta en {url}. Inicie el servidor local o revise su puerto.")
-
-
-def _doctor_codex() -> None:
-    """Comprobaciones headless, como el ToolDoctor de common-ts: versión, sesión y catálogo de modelos."""
-    codex = shutil.which("codex")
-    if not codex:
-        print("Codex: instale Codex CLI e inicie sesión con `codex login`.")
-        return
-    for etiqueta, args in [("Versión", ["--version"]), ("Sesión", ["login", "status"])]:
-        try:
-            p = subprocess.run([codex, *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
-                               timeout=20, check=False, stdin=subprocess.DEVNULL)
-            linea = next((x.strip() for x in ((p.stdout or "") + (p.stderr or "")).splitlines() if x.strip()), "sin respuesta")
-        except subprocess.TimeoutExpired:
-            linea = "no respondió (puede requerir una sesión interactiva)"
-        print(f"Codex {etiqueta.lower()}: {linea}")
-    try:
-        modelos = modelos_codex()
-    except RuntimeError as e:
-        print(f"Modelos Codex: {e}")
-        return
-    print("Modelos Codex (use --modelo y, opcionalmente, --esfuerzo):")
-    for m in modelos:
-        print(f"  {m['id']:<16} {m['nombre']:<16} razonamiento {m['nivel_defecto'] or '-'} [{', '.join(m['niveles'])}]  {m['detalle']}")
+    print("Modelos (use --modelo y, opcionalmente, --esfuerzo):")
+    for m in datos["modelos"]:
+        marca = " (por defecto)" if m["id"] == datos["defecto"] else ""
+        niveles = f" [{', '.join(m.get('niveles') or [])}]" if m.get("niveles") else ""
+        print(f"  {m['id']:<34} {m['nombre']}{marca}{niveles}")
+    if modelo and modelo not in {m["id"] for m in datos["modelos"]}:
+        print(f"Aviso: el modelo «{modelo}» no figura en el catálogo de {c.nombre}.")
 
 
 def parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="generador-rfd", description="Genera RFD Word SIPECOM desde archivos con Claude CLI o un modelo local.")
+    p = argparse.ArgumentParser(prog="generador-rfd", description="Genera RFD Word SIPECOM con Claude Code, Codex, Antigravity, Grok u OpenCode.")
     sub = p.add_subparsers(dest="comando", required=True)
     w = sub.add_parser("gui", help="Abre la interfaz web local (http://127.0.0.1:2122).")
     w.add_argument("--puerto", type=int, default=2122)
     w.add_argument("--sin-navegador", action="store_true", help="No abrir el navegador automáticamente.")
-    d = sub.add_parser("doctor", help="Comprueba Claude/Codex CLI, plantilla, CodeGraph y proveedor.")
+    d = sub.add_parser("doctor", help="Comprueba las CLIs, la plantilla, CodeGraph y el catálogo de modelos de una CLI.")
     d.add_argument("--proveedor", choices=PROVEEDORES, default="claude")
     d.add_argument("--modelo")
     g = sub.add_parser("generar", help="Extrae fuentes, llama al modelo y genera el RFD.")
@@ -104,12 +81,12 @@ def parser() -> argparse.ArgumentParser:
     g.add_argument("--tipo-proyecto", choices=["nuevo", "existente"], required=True)
     g.add_argument("--titulo")
     g.add_argument("--fecha", default=date.today().strftime("%d/%m/%Y"))
-    g.add_argument("--proveedor", choices=PROVEEDORES, default="claude", help="claude (Claude Code CLI), codex (Codex CLI con su cuenta) u ollama/lmstudio (modelos locales vía Codex CLI).")
-    g.add_argument("--modelo", default="", help="Con claude: " + ", ".join(m["id"] for m in MODELOS_CLAUDE) + " o un alias (sonnet, opus, haiku); por defecto " + MODELO_CLAUDE_DEFECTO + ". Con codex: vea `generador-rfd doctor --proveedor codex`.")
+    g.add_argument("--proveedor", choices=PROVEEDORES, default="claude", help="CLI de IA: " + ", ".join(f"{c.id} ({c.nombre})" for c in CLIS.values()) + ".")
+    g.add_argument("--modelo", default="", help="Con claude: " + ", ".join(m["id"] for m in MODELOS_CLAUDE) + " o un alias; por defecto " + MODELO_CLAUDE_DEFECTO + ". Otras CLIs: vea `generador-rfd doctor --proveedor <cli>`.")
     g.add_argument("--salida", type=Path, required=True)
     g.add_argument("--plantilla", type=Path, default=PLANTILLA)
     g.add_argument("--publico", action="store_true")
-    g.add_argument("--esfuerzo", default="", help="Sólo codex: nivel de razonamiento (low, medium, high, xhigh, max…). Vacío: el del modelo.")
+    g.add_argument("--esfuerzo", default="", help="Nivel de razonamiento de la CLI (low, medium, high, xhigh, max; en opencode, la variante del modelo). Vacío: el del modelo.")
     g.add_argument("--sin-word", action="store_true", help="No abrir Microsoft Word para actualizar el índice ni exportar PDF.")
     c = sub.add_parser("contexto-codigo", help="Muestra el contexto que CodeGraph/Repomix aporta de un proyecto, sin llamar al modelo.")
     c.add_argument("--proyecto", type=Path, required=True)

@@ -6,6 +6,43 @@ import { PASOS_MEJORA, Progreso, ResultadoVista } from "./Panel";
 
 const EXTENSIONES = [".txt", ".md", ".docx", ".pptx", ".pdf"];
 
+interface Proyecto {
+  clave: string;
+  codigo: string;
+  cliente: string;
+  principal: RfdResumen;          // versión más reciente: la que se muestra y se mejora
+  registros: RfdResumen[];        // versiones e intentos, del más reciente al más antiguo
+}
+
+const numeroVersion = (v: string) => v.split(".").map(Number).reduce((a, n) => a * 1000 + (Number.isFinite(n) ? n : 0), 0);
+
+/** Un proyecto por código RFD: la versión más alta y, a igualdad, el intento más reciente. */
+function agrupar(lista: RfdResumen[]): Proyecto[] {
+  const mapa = new Map<string, RfdResumen[]>();
+  for (const r of lista) {
+    const clave = r.codigo.trim().toLowerCase();
+    mapa.set(clave, [...(mapa.get(clave) ?? []), r]);
+  }
+  return [...mapa.entries()].map(([clave, registros]) => {
+    const orden = [...registros].sort((a, b) => numeroVersion(b.version) - numeroVersion(a.version) || b.creado.localeCompare(a.creado));
+    return { clave, codigo: orden[0].codigo, cliente: orden[0].cliente, principal: orden[0], registros: orden };
+  }).sort((a, b) => b.principal.creado.localeCompare(a.principal.creado));
+}
+
+/** Etiqueta de cada registro: «v0.2», y «v0.1 · intento 2» cuando la misma versión se generó varias veces. */
+function etiquetas(registros: RfdResumen[]): Map<number, string> {
+  const porVersion = new Map<string, RfdResumen[]>();
+  for (const r of registros) porVersion.set(r.version, [...(porVersion.get(r.version) ?? []), r]);
+  const salida = new Map<number, string>();
+  for (const [version, rs] of porVersion) {
+    const cronologico = [...rs].sort((a, b) => a.creado.localeCompare(b.creado));
+    cronologico.forEach((r, i) => salida.set(r.id, cronologico.length > 1 ? `v${version} · intento ${i + 1}` : `v${version}`));
+  }
+  return salida;
+}
+
+const fecha = (iso: string) => new Date(iso).toLocaleDateString("es", { day: "2-digit", month: "short" });
+
 function siguiente(version: string): string {
   const [a, b] = version.split(".").map(Number);
   return Number.isFinite(a) && Number.isFinite(b) ? `${a}.${b + 1}` : "0.2";
@@ -72,7 +109,7 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
     api.rfd(seleccion).then(setDetalle).catch((e: Error) => setError(e.message));
   }, [seleccion]);
   useEffect(() => {
-    if (seleccion == null && lista.length) setSeleccion(lista.find((r) => !r.mejorado)?.id ?? lista[0].id);
+    if (seleccion == null && lista.length) setSeleccion(agrupar(lista)[0].principal.id);
   }, [lista, seleccion]);
 
   useEffect(() => {
@@ -118,41 +155,67 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
   const respondidas = detalle?.preguntas.filter((p) => p.estado === "respondida").length ?? 0;
   const total = detalle?.preguntas.length ?? 0;
   const ocupado = trabajo?.estado === "en_curso";
-  const grupos = lista
-    .filter((r) => !filtro || `${r.codigo} ${r.cliente} ${r.titulo}`.toLowerCase().includes(filtro.toLowerCase()))
-    .reduce<Record<string, RfdResumen[]>>((g, r) => ({ ...g, [r.codigo]: [...(g[r.codigo] ?? []), r] }), {});
+  const proyectos = agrupar(lista);
+  const visibles = proyectos.filter((p) => !filtro || `${p.codigo} ${p.cliente} ${p.principal.titulo}`.toLowerCase().includes(filtro.toLowerCase()));
+  const proyecto = proyectos.find((p) => p.registros.some((r) => r.id === seleccion));
+  const nombres = proyecto ? etiquetas(proyecto.registros) : new Map<number, string>();
+
+  const eliminarIntento = async (r: RfdResumen) => {
+    if (!window.confirm(`¿Quitar ${nombres.get(r.id) ?? "esta versión"} del historial? Los archivos en salidas/ no se borran.`)) return;
+    try {
+      await api.eliminarRfd(r.id);
+      if (seleccion === r.id) setSeleccion(proyecto?.principal.id ?? null);
+      recargarLista();
+    } catch (e) { setError((e as Error).message); }
+  };
 
   return (
     <main className="contenido historial">
       <aside className="lista-rfds">
         <div className="lista-cab">
-          <h2>RFD guardados</h2>
-          <span>{lista.length}</span>
+          <h2>Proyectos</h2>
+          <span>{proyectos.length} · {lista.length} versiones</span>
         </div>
         <div className="entrada-icono buscador">
           <Icono n="eye" size={14} />
           <input value={filtro} onChange={(e) => setFiltro(e.target.value)} placeholder="Buscar por código, cliente o título" />
         </div>
-        {Object.entries(grupos).map(([codigo, versiones]) => (
-          <div key={codigo} className="grupo-rfd">
-            <div className="grupo-cab"><b>{codigo}</b><span>{versiones[0].cliente}</span></div>
-            {versiones.map((r) => (
-              <button key={r.id} type="button" className={`item-rfd ${seleccion === r.id ? "activo" : ""}`} onClick={() => setSeleccion(r.id)}>
-                <span className="version">v{r.version}</span>
-                <span className="item-texto">
-                  <span className="item-titulo">{r.titulo}</span>
-                  <small>{r.archivo} · {new Date(r.creado).toLocaleDateString("es")} · {r.origen}</small>
-                </span>
-                <span className="item-meta">
-                  {r.calidad != null && <em className={r.calidad >= 0.85 ? "ok" : "atencion"}>{Math.round(r.calidad * 100)}%</em>}
-                  {r.preguntas > 0 && <em>{r.respondidas}/{r.preguntas}</em>}
-                  {r.mejorado && <em className="tenue">mejorado</em>}
-                </span>
-              </button>
-            ))}
-          </div>
-        ))}
+        <ul className="lista-proyectos">
+          {visibles.map((p) => {
+            const r = p.principal;
+            const activo = proyecto?.clave === p.clave;
+            const versiones = new Set(p.registros.map((x) => x.version)).size;
+            const intentos = p.registros.length - versiones;
+            return (
+              <li key={p.clave}>
+                <button type="button" className={`proyecto ${activo ? "activo" : ""}`} onClick={() => setSeleccion(r.id)}>
+                  <span className="proyecto-cab">
+                    <b>{p.codigo}</b>
+                    <span className="version">v{r.version}</span>
+                    {r.calidad != null && <em className={r.calidad >= 0.85 ? "ok" : "atencion"}>{Math.round(r.calidad * 100)}%</em>}
+                  </span>
+                  <span className="proyecto-titulo" title={r.titulo}>{r.titulo}</span>
+                  <span className="proyecto-pie">
+                    <span>{p.cliente}</span>
+                    <span>{fecha(r.creado)}</span>
+                  </span>
+                  {(r.preguntas > 0 || p.registros.length > 1) && (
+                    <span className="proyecto-pie">
+                      {r.preguntas > 0 ? (
+                        <span className="mini-avance" title={`${r.respondidas} de ${r.preguntas} preguntas respondidas`}>
+                          <i style={{ width: `${(r.respondidas / r.preguntas) * 100}%` }} />
+                        </span>
+                      ) : <span />}
+                      {p.registros.length > 1 && <small>{versiones} versión(es){intentos > 0 ? ` · ${intentos} intento(s)` : ""}</small>}
+                    </span>
+                  )}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
         {!lista.length && <p className="vacio">Aún no hay RFD. Genere uno en la pestaña «Generar».</p>}
+        {lista.length > 0 && !visibles.length && <p className="vacio">Ningún proyecto coincide con la búsqueda.</p>}
       </aside>
 
       <section className="detalle-rfd">
@@ -161,7 +224,7 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
           <>
             <div className="panel cabecera-rfd">
               <div>
-                <small>{detalle.codigo} · {detalle.cliente} · versión {detalle.version} · {detalle.origen}{detalle.modelo ? ` con ${detalle.modelo}` : ""}</small>
+                <small>{detalle.codigo} · {detalle.cliente} · {nombres.get(detalle.id) ?? `v${detalle.version}`} · {detalle.origen}{detalle.modelo ? ` con ${detalle.modelo}` : ""}</small>
                 <h2>{detalle.titulo}</h2>
                 <p>{detalle.objetivo}</p>
               </div>
@@ -171,6 +234,23 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
                 {detalle.archivos.cuestionario && <a className="boton" href={api.archivoRfd(detalle.id, "cuestionario")}><Icono n="download" size={15} /> Cuestionario</a>}
                 <button type="button" className="boton fantasma" onClick={() => api.abrirRfd(detalle.id, "carpeta")}><Icono n="folder" size={15} /></button>
               </div>
+              {proyecto && proyecto.registros.length > 1 && (
+                <div className="versiones" role="tablist" aria-label="Versiones del proyecto">
+                  {proyecto.registros.map((r) => (
+                    <span key={r.id} className={`version-chip ${r.id === detalle.id ? "activa" : ""}`}>
+                      <button type="button" role="tab" aria-selected={r.id === detalle.id} onClick={() => setSeleccion(r.id)}
+                        title={`${r.origen} · ${new Date(r.creado).toLocaleString("es")}${r.modelo ? ` · ${r.modelo}` : ""}`}>
+                        {nombres.get(r.id)}{r.id === proyecto.principal.id && <em>actual</em>}
+                      </button>
+                      {r.id !== proyecto.principal.id && (
+                        <button type="button" className="quitar" aria-label={`Quitar ${nombres.get(r.id)}`} onClick={() => eliminarIntento(r)}>
+                          <Icono n="x" size={11} />
+                        </button>
+                      )}
+                    </span>
+                  ))}
+                </div>
+              )}
               {detalle.cambios.length > 0 && (
                 <details className="cambios-version">
                   <summary>{detalle.cambios.length} cambio(s) de la versión {detalle.version}</summary>
@@ -250,8 +330,8 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
                 {ocupado ? <><span className="girando claro" /> Procesando…</> : <><Icono n="spark" size={18} /> Mejorar a v{detalle ? siguiente(detalle.version) : ""}</>}
               </button>
               {!ocupado && detalle && !respondidas && !adjuntos.length && <p className="falta">Responda al menos una pregunta o adjunte un documento del cliente.</p>}
-              {detalle && lista.find((r) => r.id === detalle.id)?.mejorado && (
-                <p className="campo-ayuda">Este RFD ya tiene una versión posterior; mejorar desde aquí crea otra rama.</p>
+              {detalle && proyecto && detalle.id !== proyecto.principal.id && (
+                <p className="campo-ayuda">Está viendo {nombres.get(detalle.id)}; la versión actual del proyecto es v{proyecto.principal.version}. Mejorar desde aquí crea otra rama.</p>
               )}
             </>
           )}

@@ -1,10 +1,18 @@
 // Cliente tipado del servidor local (generador_rfd/servidor.py).
 
-export type Proveedor = "claude" | "codex" | "ollama" | "lmstudio";
+export type Proveedor = "claude" | "codex" | "agy" | "grok" | "opencode";
+
+export interface CliInfo {
+  id: Proveedor;
+  nombre: string;
+  proveedor: string;
+  reglas: string;
+  costo: boolean;
+  ruta?: string | null;
+}
 
 export interface Entorno {
-  claude: string | null;
-  codex: string | null;
+  clis: CliInfo[];
   codegraph: string | null;
   repomix: string | null;
   plantilla: boolean;
@@ -28,6 +36,7 @@ export interface ListaModelos {
   defecto: string;
   modelos: OpcionModelo[];
   detalle?: string;
+  cli?: CliInfo;
 }
 
 export interface Uso {
@@ -190,13 +199,13 @@ const json = (cuerpo: unknown): RequestInit => ({
 
 export const api = {
   entorno: () => pedir<Entorno>("/api/entorno"),
-  modelos: async (p: Proveedor): Promise<ListaModelos> => {
-    const r = await pedir<Partial<ListaModelos> & { modelos?: (OpcionModelo | string)[] }>(`/api/modelos?proveedor=${p}`);
+  modelos: async (p: Proveedor, refrescar = false): Promise<ListaModelos> => {
+    const r = await pedir<Partial<ListaModelos> & { modelos?: (OpcionModelo | string)[] }>(`/api/modelos?proveedor=${p}${refrescar ? "&refrescar=true" : ""}`);
     // Tolera un servidor anterior que devolvía sólo nombres.
     const modelos = (r.modelos ?? [])
       .map((m) => (typeof m === "string" ? { id: m, nombre: m, detalle: "" } : m))
       .filter((m) => m.id);
-    return { disponible: !!r.disponible, detalle: r.detalle, modelos, defecto: r.defecto || modelos[0]?.id || "" };
+    return { disponible: !!r.disponible, detalle: r.detalle, cli: r.cli, modelos, defecto: r.defecto || modelos[0]?.id || "" };
   },
   elegirCarpeta: () => pedir<{ ruta: string }>("/api/elegir-carpeta"),
   contextoCodigo: (proyecto: string, enfoque: string) =>

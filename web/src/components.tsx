@@ -1,4 +1,3 @@
-import type { OpcionModelo } from "./api";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
 const RUTAS: Record<string, string> = {
@@ -156,51 +155,6 @@ export function Modal({ titulo, subtitulo, onCerrar, children }: {
         </header>
         <div className="modal-cuerpo">{children}</div>
       </div>
-    </div>
-  );
-}
-
-export function SelectorModelo({ opciones, valor, onCambio, cargando }: {
-  opciones: OpcionModelo[]; valor: string; onCambio: (id: string) => void; cargando: boolean;
-}) {
-  const enLista = opciones.some((o) => o.id === valor);
-  const [otro, setOtro] = useState(false);
-  const personalizado = otro || (!cargando && !enLista);
-
-  return (
-    <div className="selector-modelo" role="radiogroup" aria-label="Modelo">
-      <span className="campo-etiqueta">Modelo</span>
-      {cargando && <div className="modelo-cargando"><span className="girando" /> Consultando modelos…</div>}
-      {opciones.map((o) => {
-        const activo = !personalizado && o.id === valor;
-        return (
-          <button key={o.id} type="button" role="radio" aria-checked={activo}
-            className={`opcion-modelo ${activo ? "activa" : ""}`}
-            onClick={() => { setOtro(false); onCambio(o.id); }}>
-            <span className="radio" />
-            <span className="opcion-texto">
-              <span className="opcion-cab">
-                <b>{o.nombre}</b>
-                {o.etiqueta && <em>{o.etiqueta}</em>}
-              </span>
-              <small>{o.detalle}</small>
-            </span>
-          </button>
-        );
-      })}
-      {!cargando && (
-        <div className={`opcion-modelo otro ${personalizado ? "activa" : ""}`}>
-          <button type="button" role="radio" aria-checked={personalizado} className="otro-boton"
-            onClick={() => { setOtro(true); if (enLista) onCambio(""); }}>
-            <span className="radio" />
-            <span className="opcion-texto"><b>Otro modelo</b><small>Escriba el ID o alias del modelo</small></span>
-          </button>
-          {personalizado && (
-            <input autoFocus value={valor} onChange={(e) => onCambio(e.target.value.trim())}
-              placeholder="claude-…" spellCheck={false} />
-          )}
-        </div>
-      )}
     </div>
   );
 }

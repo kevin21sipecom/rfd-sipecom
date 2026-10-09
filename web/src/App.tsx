@@ -23,7 +23,7 @@ export default function App() {
   const [titulo, setTitulo] = useState("");
   const [fecha, setFecha] = useState("");
   const [tipo, setTipo] = useState<"existente" | "nuevo">("existente");
-  const motor = useMotor();
+  const motor = useMotor(entorno?.clis ?? []);
   const [vista, setVista] = useState<"generar" | "historial" | "reglas">("generar");
   const [reglasAplicables, setReglasAplicables] = useState(0);
   const [rfdElegido, setRfdElegido] = useState<number | null>(null);
@@ -121,8 +121,9 @@ export default function App() {
         </nav>
         {entorno && (
           <div className="estados">
-            <Estado ok={!!entorno.claude} texto="Claude CLI" titulo={entorno.claude ?? "No encontrado en PATH"} />
-            <Estado ok={!!entorno.codex} texto="Codex CLI" titulo={entorno.codex ?? "No encontrado en PATH"} />
+            {entorno.clis.map((c) => (
+              <Estado key={c.id} ok={!!c.ruta} texto={c.nombre} titulo={c.ruta ?? `${c.nombre}: no encontrado en PATH`} />
+            ))}
             <Estado ok={!!(entorno.codegraph || entorno.repomix)} texto={entorno.codegraph ? "CodeGraph" : entorno.repomix ? "Repomix" : "CodeGraph"}
               titulo={entorno.codegraph ?? entorno.repomix ?? "Opcional: npm i -g @colbymchenry/codegraph"} />
             <Estado ok={entorno.plantilla} texto="Plantilla" />

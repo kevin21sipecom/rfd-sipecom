@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Interfaz web (el build se versiona en generador_rfd/static)
+web/node_modules/
+
+# Índices locales de herramientas
+.codegraph/
+.claude/
+
+# Datos y documentos generados: pueden contener información de clientes
+salidas/*
+!salidas/.gitkeep
+datos/
+docs/
+
+# Sistema operativo / editores
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+~$*.docx

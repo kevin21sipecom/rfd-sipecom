@@ -494,18 +494,24 @@ class PeticionRegla(BaseModel):
     cliente: str = ""
     activa: bool = True
 
+    def regla(self, regla_id: int | None = None) -> Regla:
+        return Regla(id=regla_id, texto=self.texto, tipo=self.tipo, seccion=self.seccion, patron=self.patron,
+                     cliente=self.cliente, activa=self.activa)
+
 
 @app.get("/api/reglas")
 def reglas(cliente: str = "") -> dict[str, Any]:
     todas = almacen().reglas()
-    return {"reglas": [r.como_dict() for r in todas], "secciones": SECCIONES,
+    from .reglas_defecto import OBSERVACIONES
+
+    return {"reglas": [r.como_dict() for r in todas], "secciones": SECCIONES, "observaciones": OBSERVACIONES,
             "aplicables": [r.id for r in almacen().reglas_para(cliente)]}
 
 
 @app.post("/api/reglas")
 def crear_regla(p: PeticionRegla) -> dict[str, Any]:
     try:
-        return almacen().guardar_regla(Regla(**p.model_dump())).como_dict()
+        return almacen().guardar_regla(p.regla()).como_dict()
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
 
@@ -513,7 +519,7 @@ def crear_regla(p: PeticionRegla) -> dict[str, Any]:
 @app.put("/api/reglas/{regla_id}")
 def editar_regla(regla_id: int, p: PeticionRegla) -> dict[str, Any]:
     try:
-        return almacen().guardar_regla(Regla(id=regla_id, **p.model_dump())).como_dict()
+        return almacen().guardar_regla(p.regla(regla_id)).como_dict()
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     except KeyError as e:
@@ -522,8 +528,19 @@ def editar_regla(regla_id: int, p: PeticionRegla) -> dict[str, Any]:
 
 @app.delete("/api/reglas/{regla_id}")
 def eliminar_regla(regla_id: int) -> dict[str, bool]:
-    almacen().eliminar_regla(regla_id)
+    try:
+        almacen().eliminar_regla(regla_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
     return {"ok": True}
+
+
+@app.post("/api/reglas/{regla_id}/restaurar")
+def restaurar_regla(regla_id: int) -> dict[str, Any]:
+    try:
+        return almacen().restaurar_regla(regla_id).como_dict()
+    except KeyError as e:
+        raise HTTPException(404, str(e)) from e
 
 
 if ESTATICOS.is_dir():

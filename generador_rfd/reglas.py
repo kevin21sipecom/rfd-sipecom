@@ -34,6 +34,7 @@ SECCIONES: dict[str, str] = {
     "entregables": "Entregables",
     "esfuerzo": "Esfuerzo",
     "preguntas": "Preguntas para el cliente",
+    "anexos": "Anexos",
 }
 POR_REQUERIMIENTO = {"requerimientos", "criterios", "flujo"}
 
@@ -47,13 +48,16 @@ class Regla:
     cliente: str = ""
     activa: bool = True
     id: int | None = None
+    codigo: str = ""              # REG-001… en las reglas predeterminadas
+    observacion: str = ""         # observación del documento de origen (001…006)
+    predeterminada: bool = False
 
     def como_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @property
     def etiqueta(self) -> str:
-        return f"R{self.id}" if self.id is not None else "R"
+        return self.codigo or (f"R{self.id}" if self.id is not None else "R")
 
 
 def validar_regla(r: Regla) -> Regla:
@@ -88,6 +92,8 @@ def compilar(patron: str) -> re.Pattern[str] | None:
 # ---------------------------------------------------------------- prompt
 
 def bloque_prompt(reglas: list[Regla]) -> str:
+    from .reglas_defecto import CONDICIONES, OBSERVACIONES
+
     activas = [r for r in reglas if r.activa]
     if not activas:
         return ""
@@ -95,10 +101,17 @@ def bloque_prompt(reglas: list[Regla]) -> str:
         "REGLAS DEL EQUIPO (obligatorias; prevalecen sobre la guía de redacción y las metas de extensión, "
         "nunca sobre las reglas de integridad)",
     ]
-    for r in activas:
+    grupo = None
+    for r in sorted(activas, key=lambda x: (not x.predeterminada, x.codigo, x.id or 0)):
+        actual = OBSERVACIONES.get(r.observacion, "Reglas propias del equipo") if r.predeterminada else "Reglas propias del equipo"
+        if actual != grupo:
+            grupo = actual
+            lineas.append(f"{grupo}:")
         verbo = "NO HACER" if r.tipo == "evitar" else "HACER SIEMPRE"
         ambito = SECCIONES[r.seccion] + (f" · sólo para {r.cliente}" if r.cliente else "")
         lineas.append(f"- [{r.etiqueta}] {verbo} ({ambito}): {r.texto}")
+    if any(r.predeterminada for r in activas):
+        lineas += ["", CONDICIONES]
     return "\n".join(lineas)
 
 
@@ -147,6 +160,7 @@ def textos_de(d: dict[str, Any], seccion: str) -> list[Texto]:
                     + [(f"Actividad {a.get('actividad', '')}", f"{a.get('actividad', '')} {a.get('horas') or ''}") for a in esf.get("actividades", [])]
                     + [("Duración", esf.get("duracion", "") or "")],
         "preguntas": [(p["id"], f"{p['contexto']} {p['pregunta']}") for p in d.get("preguntas_cliente", [])],
+        "anexos": [(f"Anexo {a.get('id', '')}", f"{a.get('nombre', '')}. {a.get('uso', '')}") for a in d.get("anexos", [])],
     }
     if seccion == "todo":
         return [("Título", d.get("titulo", ""))] + [t for k, v in por_seccion.items() if k not in ("criterios", "flujo") for t in v]

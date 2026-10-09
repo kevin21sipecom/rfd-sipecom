@@ -71,6 +71,12 @@ class Almacen:
         self._candado = threading.Lock()
         with self._conexion() as c:
             c.executescript(ESQUEMA_SQL)
+            columnas = {f["name"] for f in c.execute("PRAGMA table_info(reglas)")}
+            for columna, tipo in (("codigo", "TEXT NOT NULL DEFAULT ''"), ("observacion", "TEXT NOT NULL DEFAULT ''"),
+                                  ("predeterminada", "INTEGER NOT NULL DEFAULT 0")):
+                if columna not in columnas:
+                    c.execute(f"ALTER TABLE reglas ADD COLUMN {columna} {tipo}")
+        self.cargar_reglas_predeterminadas()
 
     @contextmanager
     def _conexion(self) -> Iterator[sqlite3.Connection]:
@@ -198,11 +204,36 @@ class Almacen:
     @staticmethod
     def _regla(f: sqlite3.Row) -> Regla:
         return Regla(id=f["id"], tipo=f["tipo"], texto=f["texto"], seccion=f["seccion"], patron=f["patron"],
-                     cliente=f["cliente"], activa=bool(f["activa"]))
+                     cliente=f["cliente"], activa=bool(f["activa"]), codigo=f["codigo"], observacion=f["observacion"],
+                     predeterminada=bool(f["predeterminada"]))
+
+    def cargar_reglas_predeterminadas(self) -> int:
+        """Agrega las reglas REG-xxx que falten (no reactiva ni pisa las que el equipo ajustó o desactivó)."""
+        from .reglas_defecto import REGLAS
+
+        with self._conexion() as c:
+            existentes = {f[0] for f in c.execute("SELECT codigo FROM reglas WHERE predeterminada = 1")}
+            nuevas = [(tipo, texto, seccion, patron, codigo, obs, _ahora(), _ahora())
+                      for codigo, obs, tipo, seccion, texto, patron in REGLAS if codigo not in existentes]
+            c.executemany("INSERT INTO reglas (tipo, texto, seccion, patron, cliente, activa, codigo, observacion, predeterminada, "
+                          "creada, actualizada) VALUES (?, ?, ?, ?, '', 1, ?, ?, 1, ?, ?)", nuevas)
+        return len(nuevas)
+
+    def restaurar_regla(self, regla_id: int) -> Regla:
+        """Devuelve una regla predeterminada a su texto, tipo, sección y verificación originales."""
+        from .reglas_defecto import REGLAS
+
+        actual = next((r for r in self.reglas() if r.id == regla_id), None)
+        original = next((x for x in REGLAS if actual and x[0] == actual.codigo), None)
+        if actual is None or not actual.predeterminada or original is None:
+            raise KeyError(f"La regla {regla_id} no es una regla predeterminada.")
+        _, _, actual.tipo, actual.seccion, actual.texto, actual.patron = original
+        actual.cliente, actual.activa = "", True
+        return self.guardar_regla(actual)
 
     def reglas(self) -> list[Regla]:
         with self._conexion() as c:
-            return [self._regla(f) for f in c.execute("SELECT * FROM reglas ORDER BY activa DESC, cliente, id")]
+            return [self._regla(f) for f in c.execute("SELECT * FROM reglas ORDER BY predeterminada DESC, codigo, id")]
 
     def reglas_para(self, cliente: str) -> list[Regla]:
         """Reglas activas globales y las del cliente indicado (sin distinguir mayúsculas)."""
@@ -228,6 +259,9 @@ class Almacen:
 
     def eliminar_regla(self, regla_id: int) -> None:
         with self._conexion() as c:
+            fila = c.execute("SELECT predeterminada, codigo FROM reglas WHERE id = ?", (regla_id,)).fetchone()
+            if fila and fila["predeterminada"]:
+                raise ValueError(f"{fila['codigo']} es una regla predeterminada: desactívela en lugar de eliminarla.")
             c.execute("DELETE FROM reglas WHERE id = ?", (regla_id,))
 
     # ------------------------------------------------------------------ importación

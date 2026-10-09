@@ -22,7 +22,7 @@ from generador_rfd.fuentes import Fuente, cargar_fuentes
 from generador_rfd.modelo import analizar_fuentes, comando_claude, crear_prompt, temas_de_codigo
 from generador_rfd.pipeline import publicar, terminos_ajenos
 from generador_rfd.proyecto import inventario_repositorios
-from generador_rfd.schema import SCHEMA, auditar_texto_final
+from generador_rfd.schema import SCHEMA, auditar_texto_final, normalizar
 from generador_rfd.word import NS, texto_docx
 
 RAIZ = Path(__file__).resolve().parent.parent
@@ -287,7 +287,7 @@ def test_reglas_del_equipo_se_inyectan_y_verifican(tmp_path, monkeypatch):
     a.guardar_regla(Regla(texto="Regla desactivada de prueba", activa=False))
     with pytest.raises(ValueError, match="expresión válida"):
         a.guardar_regla(Regla(texto="Patrón roto en la verificación", patron="re:(abc"))
-    reglas = a.reglas_para("Cliente Demostración")
+    reglas = [r for r in a.reglas_para("Cliente Demostración") if not r.predeterminada]
     assert [r.id for r in reglas] == [evitar.id, exigir.id]
     assert otro.id in [r.id for r in a.reglas_para("otro sa")]
 
@@ -320,6 +320,48 @@ def test_reglas_del_equipo_se_inyectan_y_verifican(tmp_path, monkeypatch):
                                                  datos_base=datos, revisar_word=False, reglas=reglas))
     assert "REGLAS DEL EQUIPO" in recibido["reglas"]
     assert {h.codigo for h in r.hallazgos} >= {"regla_incumplida"}
+
+
+def test_reglas_predeterminadas_del_documento_de_correcciones(tmp_path):
+    from generador_rfd.almacen import Almacen
+    from generador_rfd.reglas import bloque_prompt, incumplidas
+
+    a = Almacen(tmp_path / "rfd.db")
+    defecto = [r for r in a.reglas() if r.predeterminada]
+    assert [r.codigo for r in defecto] == [f"REG-{i:03}" for i in range(1, 31)]
+    reg003 = next(r for r in defecto if r.codigo == "REG-003")
+    reg003.activa, reg003.texto = False, "Texto ajustado por el equipo"
+    a.guardar_regla(reg003)
+    assert Almacen(tmp_path / "rfd.db").cargar_reglas_predeterminadas() == 0  # no duplica ni reactiva
+    assert not next(r for r in a.reglas() if r.codigo == "REG-003").activa
+    with pytest.raises(ValueError, match="desactívela"):
+        a.eliminar_regla(reg003.id)
+    restaurada = a.restaurar_regla(reg003.id)
+    assert restaurada.activa and restaurada.texto.startswith("Excluir condiciones de revisión humana")
+
+    reglas = a.reglas_para("Banco Northwind")
+    bloque = bloque_prompt(reglas)
+    assert "Narrativas internas y autoconfirmaciones:" in bloque and "[REG-030]" in bloque
+    assert "CONDICIONES DE APLICACIÓN" in bloque and "token de autenticación" in bloque
+
+    datos = normalizar(_demo_con_preguntas())
+    datos["justificacion"] = [
+        "La documentación recibida describe el portal de clientes. El resultado inmediato solicitado es un RFD para revisión humana "
+        "y la fuente no autoriza iniciar directamente la implementación.",
+        "La adecuación deberá considerar la autenticación personalizada mediante tokens del sistema existente.",
+    ]
+    datos["proceso_actual"] = ["La transcripción identifica dos interfaces. No se suministra el inventario del portal administrativo."]
+    datos["anexos"] = [{"id": "F-01", "nombre": "writing-block.pdf", "uso": "Contexto; base de RF-01."},
+                       {"id": "F-02", "nombre": "Repositorios del proyecto (CodeGraph)", "uso": "Inventario parcial; sustento AS-IS de RF-01."}]
+    fallas = {r.codigo for r, _ in incumplidas(datos, reglas)}
+    assert {"REG-003", "REG-006", "REG-024", "REG-026", "REG-027", "REG-028"} <= fallas
+    assert "REG-001" not in fallas  # V-02: los tokens de autenticación del sistema no son tokens de IA
+
+    con_anexos = publicar(datos, tmp_path / "con_anexos.docx")
+    assert "Capítulo 8" in texto_docx(con_anexos.salida)
+    datos["anexos"] = []
+    sin_anexos = publicar(datos, tmp_path / "sin_anexos.docx")
+    assert "Capítulo 8" not in texto_docx(sin_anexos.salida) and "Capítulo 7" in texto_docx(sin_anexos.salida)
 
 
 requiere_codex = pytest.mark.skipif(not shutil.which("codex"), reason="Codex CLI no está en PATH")

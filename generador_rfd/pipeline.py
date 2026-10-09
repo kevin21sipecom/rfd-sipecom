@@ -121,7 +121,7 @@ def escribir_informe(datos: dict, hallazgos: list[Hallazgo], ruta: Path, uso: di
                    for c in calidad["criterios"]]
     if calidad and calidad.get("reglas"):
         lineas += ["", "## Reglas del equipo aplicadas", ""]
-        lineas += [f"- R{r['id']} ({r['tipo']}, {r['seccion']}{', ' + r['cliente'] if r['cliente'] else ''}): {r['texto']}"
+        lineas += [f"- {r['codigo'] or 'R' + str(r['id'])} ({r['tipo']}, {r['seccion']}{', ' + r['cliente'] if r['cliente'] else ''}): {r['texto']}"
                    + (f" · verificación: `{r['patron']}`" if r["patron"] else " · sólo instrucción") for r in calidad["reglas"]]
     lineas += ["", "## Definiciones requeridas antes de construir", ""]
     lineas += [f"- **{x['id']} {x['titulo']}:** {x['descripcion']} ({', '.join(x['evidencias']) or 'sin evidencia'})"

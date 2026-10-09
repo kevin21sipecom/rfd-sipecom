@@ -142,8 +142,8 @@ def evaluar(d: dict[str, Any], analisis: dict[str, dict[str, Any]] | None = None
                  f"{len(comp)} componente(s); sin repositorio: {', '.join(sin_ubicacion[:4])}; adecuación breve: {', '.join(breves[:4])}")
     pre = d["prerrequisitos"]["items"]
     sin_resp = [p[:40] for p in pre if not RESPONSABLE.search(p)]
-    criterio("prerrequisitos", "8-14 prerrequisitos de 12-50 palabras, cada uno con responsable",
-             8 <= len(pre) <= 14 and not _fuera(pre, 12, 50) and not sin_resp,
+    criterio("prerrequisitos", "Hasta 14 prerrequisitos reales de 12-50 palabras, cada uno con responsable",
+             len(pre) <= 14 and not _fuera(pre, 12, 50) and not sin_resp,
              f"{len(pre)} prerrequisito(s); sin responsable: {len(sin_resp)}")
     rest = d["restricciones"]
     criterio("restricciones", "8-12 restricciones de 12-50 palabras", 8 <= len(rest) <= 12 and not _fuera(rest, 12, 50),
@@ -165,9 +165,6 @@ def evaluar(d: dict[str, Any], analisis: dict[str, dict[str, Any]] | None = None
         criterio("preguntas", "Preguntas para el cliente: al menos una por D-xx (mínimo 8), con tema breve, contexto de 10-60 palabras y pregunta directa",
                  len(preguntas) >= max(8, len(defs)) and not sin_pregunta and not mal_formadas,
                  f"{len(preguntas)} pregunta(s); D-xx sin pregunta: {', '.join(sin_pregunta[:6])}; a corregir: {', '.join(mal_formadas[:6])}")
-    anexos_sin_rf = [a["id"] for a in d["anexos"] if not re.search(r"RF-\d|AS-IS", a["uso"])]
-    criterio("anexos", "Cada anexo F-xx indica su tema y el RF que sustenta", bool(d["anexos"]) and not anexos_sin_rf,
-             "sin RF: " + ", ".join(anexos_sin_rf))
 
     # Estilo global
     textos = (d["justificacion"] + [d["objetivo"]] + d["proceso_actual"] + [p for s in generales for p in s["parrafos"]]

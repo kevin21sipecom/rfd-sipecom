@@ -379,15 +379,15 @@ def _cuerpo(parrafos: list[etree._Element], tablas: list[etree._Element], d: dic
         poner_texto(celda, f"Fecha: {PENDIENTE}")
     bloques.append(aprobacion)
 
-    # Capítulo 8
-    h1(parrafos[88])
-    p("Documentos y componentes de referencia utilizados para definir el alcance funcional.", muestra=parrafos[89])
-    for a in d["anexos"]:
-        p(f"{a['id']} — {a['nombre']}", negrita=True)
-        if a["uso"].strip():
-            p(a["uso"])
-    if not d["anexos"]:
-        p("No se registran anexos.")
+    # Capítulo 8: sólo con anexos que formen parte del entregable; sin ellos el capítulo no se imprime
+    # y el índice se arma con los capítulos efectivos.
+    if d["anexos"]:
+        h1(parrafos[88])
+        p("Documentos que forman parte del entregable.", muestra=parrafos[89])
+        for a in d["anexos"]:
+            p(f"{a['id']} — {a['nombre']}", negrita=True)
+            if a["uso"].strip():
+                p(a["uso"])
     return bloques, toc
 
 

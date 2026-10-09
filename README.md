@@ -171,6 +171,8 @@ Salidas en `salidas/`:
 
 **Reglas del equipo** (pestaña *Reglas* o `generador-rfd reglas`): instrucciones que se agregan a cada llamada al modelo, después de las reglas de integridad.
 
+**Reglas predeterminadas (REG-001 a REG-030).** Provienen del documento *Reglas y correcciones para el generador de RFD* v1.0 y se cargan solas en el historial. Agrupadas en seis observaciones — narrativas internas y autoconfirmaciones, justificaciones por información no disponible, prerrequisitos y asignaciones internas, nombres y datos del operador, decisiones y coordinación internas, y anexos de trabajo — aseguran que el RFD explique la necesidad, las funcionalidades y el alcance **sin** trasladar el proceso interno de elaboración. Se pueden ajustar o desactivar (y restaurar), pero no eliminar. Las que tienen verificación sólo *localizan* frases típicas («no se suministró», «revisión humana», «según la transcripción», CodeGraph…); la corrección la hace el modelo con el contexto completo, de modo que un mecanismo legítimo del cliente (p. ej. tokens de autenticación) se conserva. Con ellas, los anexos quedan vacíos por defecto y el capítulo 8 sólo se imprime si hay anexos del entregable; la trazabilidad fuente → RF queda en el informe interno `*.revision.md`.
+
 - **Evitar / Exigir**, por **sección** (todo, requerimientos, criterios, flujos, esfuerzo, preguntas…) y por **cliente** (vacío = todos).
 - **Verificación automática opcional:** términos separados por `|` o una expresión con `re:`. Cada regla verificable es un criterio más de la rúbrica; si persiste el incumplimiento, el informe registra `regla_incumplida` con su ubicación.
 

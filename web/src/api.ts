@@ -148,11 +148,15 @@ export interface Regla {
   patron: string;
   cliente: string;
   activa: boolean;
+  codigo?: string;
+  observacion?: string;
+  predeterminada?: boolean;
 }
 
 export interface ListaReglas {
   reglas: Regla[];
   secciones: Record<string, string>;
+  observaciones: Record<string, string>;
   aplicables: number[];
 }
 
@@ -220,6 +224,7 @@ export const api = {
   guardarRegla: (r: Regla) => r.id == null
     ? pedir<Regla>("/api/reglas", json(r))
     : pedir<Regla>(`/api/reglas/${r.id}`, { ...json(r), method: "PUT" }),
+  restaurarRegla: (id: number) => pedir<Regla>(`/api/reglas/${id}/restaurar`, { method: "POST" }),
   eliminarRegla: (id: number) => pedir<{ ok: boolean }>(`/api/reglas/${id}`, { method: "DELETE" }),
   archivoRfd: (id: number, tipo: "docx" | "pdf" | "cuestionario" | "revision" | "json") => `/api/rfds/${id}/archivo/${tipo}`,
 };

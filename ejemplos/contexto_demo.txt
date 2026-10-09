@@ -1,0 +1,12 @@
+Proyecto ficticio: portal de soporte interno de Cliente Demostración. Ninguna empresa real está representada.
+El buzón compartido y la hoja de cálculo continuarán sólo para consulta histórica; no se migrarán registros.
+Usuarios: solicitante, analista y coordinador. El directorio corporativo existente autentica a los tres roles.
+El cliente proporcionará acceso al directorio, servicio SMTP de pruebas, catálogo de categorías y usuarios de prueba.
+Los adjuntos permitidos serán PDF, PNG o JPG de hasta 10 MB por archivo.
+Las notificaciones se enviarán por el servicio de correo del cliente; un fallo de correo no debe duplicar la solicitud.
+Desglose de 140 horas: análisis y diseño 24, construcción 80, pruebas QA 16, soporte a certificación del cliente 12 y despliegue/cierre 8.
+Entregables acordados: RFD, portal funcional, informe de pruebas, guía de despliegue y acta de aceptación pendiente de firma.
+Este material es demostrativo y no contiene datos operativos, secretos ni aprobaciones reales.
+Permisos acordados: sólo el coordinador asigna analistas; sólo el analista cambia estados; el solicitante registra y consulta únicamente sus solicitudes.
+El historial registrará usuario, fecha, estado anterior y estado nuevo, además de los eventos de asignación.
+El CSV incluirá folio, fecha de registro, categoría, prioridad, responsable y estado actual. Si no hay resultados, conservará los encabezados.

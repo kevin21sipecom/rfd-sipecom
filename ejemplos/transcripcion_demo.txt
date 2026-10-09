@@ -1,0 +1,14 @@
+Reunión de levantamiento ficticia para demostración del generador de RFD.
+Coordinador: Hoy las solicitudes de soporte interno llegan a un buzón compartido y se registran manualmente en una hoja de cálculo.
+Analista: La hoja no conserva de forma confiable quién cambió el estado ni cuándo ocurrió el cambio.
+Solicitante: Necesitamos registrar solicitudes en un portal y consultar su avance sin preguntar por correo.
+Coordinador: El formulario debe pedir asunto, descripción, categoría y prioridad. El adjunto será opcional.
+Analista: Al guardar una solicitud válida, el sistema debe asignar un folio único y confirmar el registro al solicitante.
+Coordinador: Sólo el coordinador asignará un analista responsable.
+Analista: Usaremos los estados Nuevo, En análisis, En espera, Resuelto y Cerrado; cada cambio debe quedar en el historial.
+Solicitante: Podré buscar por folio y ver el estado actual y los cambios anteriores de mis solicitudes.
+Coordinador: Queremos correo de aviso al registrar, asignar y resolver una solicitud.
+Coordinador: También necesitamos descargar un reporte CSV filtrado por fechas y estado.
+Analista: El alcance no incluye migrar el histórico de la hoja de cálculo ni desarrollar una aplicación móvil.
+Coordinador: Se usarán cuentas internas del directorio corporativo para ingresar al portal.
+Equipo de demostración: La estimación acordada para este caso ficticio es 140 horas y 4 semanas laborables.

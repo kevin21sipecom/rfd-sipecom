@@ -1,0 +1,298 @@
+{
+  "titulo": "DEMO Portal de registro y seguimiento de solicitudes de soporte interno",
+  "cliente": "Cliente Demostración (ficticio)",
+  "codigo": "DEMO-RFD1",
+  "fecha": "01/OCT/2026",
+  "tipo_proyecto": "existente",
+  "justificacion": [
+    "Actualmente las solicitudes de soporte interno llegan a un buzón compartido y se registran manualmente en una hoja de cálculo. Este mecanismo dificulta conocer el responsable y el estado de cada caso, y no ofrece un historial confiable de cambios. El cliente necesita un registro centralizado y una consulta autónoma para los solicitantes."
+  ],
+  "objetivo": "Implementar un portal interno que permita registrar, asignar, dar seguimiento y consultar solicitudes de soporte mediante un folio único, con historial de estados, notificaciones y un reporte CSV para la coordinación.",
+  "alcance": {
+    "introduccion": [
+      "El alcance comprende el portal interno de solicitudes descrito en el Capítulo 2 para el caso ficticio de demostración."
+    ],
+    "items": [
+      {
+        "id": "RF-01",
+        "descripcion": "Registro de solicitudes con asunto, descripción, categoría, prioridad y adjunto opcional; asignación de folio único."
+      },
+      {
+        "id": "RF-02",
+        "descripcion": "Asignación de analista y gestión de estados con historial de cambios."
+      },
+      {
+        "id": "RF-03",
+        "descripcion": "Consulta de solicitudes propias por folio, avisos por correo y exportación CSV filtrada."
+      },
+      {
+        "id": "RF-04",
+        "descripcion": "Reporte de solicitudes."
+      },
+      {
+        "id": "RF-05",
+        "descripcion": "Ajustar los componentes del portal interno necesarios para los flujos anteriores."
+      }
+    ],
+    "cierre": "El alcance se ejecutará con base en las definiciones aprobadas del presente documento. Las incorporaciones que modifiquen esta base serán evaluadas mediante el proceso de control de cambios."
+  },
+  "proceso_actual": [
+    "El solicitante envía un correo al buzón compartido. Un analista transcribe la solicitud a una hoja de cálculo y el coordinador asigna el caso por correo. El estado se actualiza manualmente, sin una bitácora confiable ni una consulta directa para el solicitante."
+  ],
+  "secciones_generales": [
+    {
+      "titulo": "Proceso propuesto",
+      "parrafos": [
+        "El solicitante ingresa con su cuenta corporativa y registra una solicitud en el portal. El sistema valida los campos, asigna un folio y notifica el registro. El coordinador asigna un analista; los cambios de estado quedan registrados y el solicitante consulta el avance. La coordinación puede exportar el reporte filtrado."
+      ]
+    }
+  ],
+  "requerimientos": [
+    {
+      "id": "RF-01",
+      "nombre": "Registro de solicitudes",
+      "parrafos": [
+        "El portal permitirá al solicitante crear una solicitud con asunto, descripción, categoría y prioridad obligatorios. Podrá adjuntar un PDF, PNG o JPG de hasta 10 MB. Después de validar los datos, el sistema asignará un folio único, guardará la solicitud con estado Nuevo y mostrará la confirmación."
+      ],
+      "referencia": "",
+      "elementos": [],
+      "flujo": [
+        {
+          "numero": 1,
+          "actor": "Solicitante",
+          "componente": "Portal de soporte",
+          "accion": "Ingresa los campos requeridos y, opcionalmente, un adjunto permitido."
+        },
+        {
+          "numero": 2,
+          "actor": "Portal de soporte",
+          "componente": "Validación de solicitudes",
+          "accion": "Valida campos y archivo; registra la solicitud con estado Nuevo y folio único."
+        },
+        {
+          "numero": 3,
+          "actor": "Portal de soporte",
+          "componente": "Interfaz y correo",
+          "accion": "Muestra el folio y envía aviso de registro al solicitante."
+        }
+      ],
+      "criterios_aceptacion": [
+        "Dado un formulario con los cuatro campos obligatorios válidos, al registrar la solicitud el portal muestra un folio único y el estado Nuevo.",
+        "Dado un adjunto de formato distinto de PDF, PNG o JPG, o mayor de 10 MB, al enviar el formulario el portal rechaza el archivo y explica la causa sin crear la solicitud.",
+        "Si el servicio de correo falla después del registro, la solicitud conserva su folio y no se crea una segunda solicitud."
+      ],
+      "evidencias": [
+        "F01 L5-L6",
+        "F02 L5-L6"
+      ]
+    },
+    {
+      "id": "RF-02",
+      "nombre": "Asignación y seguimiento",
+      "parrafos": [
+        "El coordinador podrá asignar un analista a una solicitud. Los estados admitidos serán Nuevo, En análisis, En espera, Resuelto y Cerrado. Cada asignación y cambio de estado quedará registrado con usuario, fecha y valor anterior y nuevo para consulta posterior."
+      ],
+      "referencia": "",
+      "elementos": [],
+      "flujo": [
+        {
+          "numero": 1,
+          "actor": "Coordinador",
+          "componente": "Bandeja de solicitudes",
+          "accion": "Selecciona una solicitud en estado Nuevo y asigna un analista."
+        },
+        {
+          "numero": 2,
+          "actor": "Portal de soporte",
+          "componente": "Gestión de estados",
+          "accion": "Guarda la asignación, actualiza el responsable y registra el evento en el historial."
+        },
+        {
+          "numero": 3,
+          "actor": "Analista",
+          "componente": "Detalle de solicitud",
+          "accion": "Actualiza el estado durante la atención; el portal registra cada transición."
+        }
+      ],
+      "criterios_aceptacion": [
+        "Dada una solicitud sin responsable, cuando el coordinador asigna un analista, el detalle muestra al responsable y el historial registra usuario y fecha de asignación.",
+        "Dado un cambio de estado válido, cuando el analista lo guarda, el historial muestra el estado anterior, el nuevo, el usuario y la fecha.",
+        "Un solicitante no puede asignar analistas ni modificar el estado de una solicitud."
+      ],
+      "evidencias": [
+        "F01 L7-L8",
+        "F02 L3",
+        "F02 L10-L11"
+      ]
+    },
+    {
+      "id": "RF-03",
+      "nombre": "Consulta y notificaciones",
+      "parrafos": [
+        "El solicitante podrá buscar sus solicitudes por folio y consultar estado actual e historial. El sistema enviará avisos por correo al registrar, asignar y resolver una solicitud mediante el servicio del cliente."
+      ],
+      "referencia": "",
+      "elementos": [],
+      "flujo": [
+        {
+          "numero": 1,
+          "actor": "Solicitante",
+          "componente": "Consulta del portal",
+          "accion": "Ingresa el folio de una solicitud propia."
+        },
+        {
+          "numero": 2,
+          "actor": "Portal de soporte",
+          "componente": "Consulta e historial",
+          "accion": "Devuelve el estado actual y los cambios registrados para esa solicitud."
+        },
+        {
+          "numero": 3,
+          "actor": "Portal de soporte",
+          "componente": "Notificaciones",
+          "accion": "Envía un correo al producirse registro, asignación o resolución."
+        }
+      ],
+      "criterios_aceptacion": [
+        "Dado un folio propio existente, cuando el solicitante consulta, el portal presenta estado actual e historial en orden cronológico.",
+        "Dado un folio de otro solicitante, cuando se consulta, el portal no revela la solicitud.",
+        "Cuando una solicitud pasa a Resuelto, el servicio de correo recibe un aviso dirigido al solicitante."
+      ],
+      "evidencias": [
+        "F01 L9-L10",
+        "F02 L6",
+        "F02 L10"
+      ]
+    },
+    {
+      "id": "RF-04",
+      "nombre": "Reporte de solicitudes",
+      "parrafos": [
+        "El coordinador podrá exportar un archivo CSV de solicitudes filtradas por rango de fechas y estado. El archivo incluirá folio, fecha de registro, categoría, prioridad, responsable y estado actual."
+      ],
+      "referencia": "",
+      "elementos": [],
+      "flujo": [
+        {
+          "numero": 1,
+          "actor": "Coordinador",
+          "componente": "Reporte del portal",
+          "accion": "Selecciona rango de fechas y estado."
+        },
+        {
+          "numero": 2,
+          "actor": "Portal de soporte",
+          "componente": "Exportación CSV",
+          "accion": "Genera un archivo con las solicitudes que cumplen los filtros."
+        }
+      ],
+      "criterios_aceptacion": [
+        "Dado un rango de fechas y un estado, al exportar el portal produce un CSV con sólo las solicitudes que cumplen ambos filtros.",
+        "Cuando el filtro no tiene resultados, el CSV contiene encabezados y ninguna fila de datos."
+      ],
+      "evidencias": [
+        "F01 L11",
+        "F02 L12"
+      ]
+    }
+  ],
+  "componentes": {
+    "id": "RF-05",
+    "titulo": "Adecuaciones de los componentes existentes",
+    "introduccion": "Los ajustes se realizarán sobre los componentes ficticios del caso de demostración.",
+    "items": [
+      {
+        "componente": "Portal interno",
+        "ubicacion": "demo-portal-web",
+        "adecuacion": "Formulario de registro, bandeja de seguimiento y consulta por folio."
+      },
+      {
+        "componente": "Servicio de notificaciones",
+        "ubicacion": "demo-notificador",
+        "adecuacion": "Envío de correos al registrar, asignar y resolver solicitudes."
+      }
+    ]
+  },
+  "prerrequisitos": {
+    "introduccion": "Previo a la construcción, el Cliente deberá garantizar la disponibilidad de los siguientes insumos.",
+    "items": [
+      "El cliente proporcionará acceso de pruebas al directorio corporativo y usuarios de los tres roles antes de iniciar integración.",
+      "El cliente habilitará un servicio SMTP de pruebas y entregará el catálogo inicial de categorías.",
+      "El cliente designará responsables de negocio para validar estados, reporte y criterios de aceptación."
+    ]
+  },
+  "definiciones": [],
+  "restricciones": [
+    "No se migrará el histórico de la hoja de cálculo al nuevo portal.",
+    "El alcance es interno; no incluye aplicación móvil ni acceso de clientes externos.",
+    "La firma del acta de aceptación queda sujeta a la certificación del cliente."
+  ],
+  "entregables": [
+    {
+      "fase": "Análisis y diseño",
+      "entregable": "RFD aprobado y diseño funcional del portal."
+    },
+    {
+      "fase": "Construcción",
+      "entregable": "Portal funcional con registro, asignación, consulta, avisos y reporte CSV."
+    },
+    {
+      "fase": "Pruebas",
+      "entregable": "Informe de pruebas QA y soporte a la certificación del cliente."
+    },
+    {
+      "fase": "Despliegue y cierre",
+      "entregable": "Guía de despliegue y acta de aceptación pendiente de firma."
+    }
+  ],
+  "esfuerzo": {
+    "introduccion": "",
+    "actividades": [
+      {
+        "actividad": "Análisis y diseño",
+        "horas": 24
+      },
+      {
+        "actividad": "Construcción",
+        "horas": 80
+      },
+      {
+        "actividad": "Pruebas QA",
+        "horas": 16
+      },
+      {
+        "actividad": "Soporte a certificación del cliente",
+        "horas": 12
+      },
+      {
+        "actividad": "Despliegue y cierre",
+        "horas": 8
+      }
+    ],
+    "total_horas": 140,
+    "duracion": "4 semanas laborables",
+    "notas": [
+      "El proyecto iniciará conforme a la aprobación y planificación acordadas con el cliente."
+    ]
+  },
+  "responsables": {
+    "autor": "Equipo de análisis SIPECOM",
+    "revisor": "Responsable de fábrica SIPECOM",
+    "aprobador_sipecom": "Representante SIPECOM por designar",
+    "aprobador_cliente": "Representante del cliente por designar"
+  },
+  "anexos": [
+    {
+      "id": "A-01",
+      "nombre": "Transcripción ficticia de levantamiento (transcripcion_demo.txt).",
+      "uso": ""
+    },
+    {
+      "id": "A-02",
+      "nombre": "Contexto ficticio del proyecto (contexto_demo.txt).",
+      "uso": ""
+    }
+  ],
+  "supuestos": [],
+  "pendientes": []
+}

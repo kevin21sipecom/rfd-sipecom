@@ -13,6 +13,7 @@ const RUTAS: Record<string, string> = {
   doc: "M7 3h7l5 5v12a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1zm7 0v5h5",
   play: "M7 5v14l11-7z",
   refresh: "M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7",
+  send: "M21 3 10 14M21 3l-7 18-4-7-7-4z",
 };
 
 export function Icono({ n, size = 18 }: { n: keyof typeof RUTAS | string; size?: number }) {
@@ -58,6 +59,7 @@ export function ZonaArchivos({ titulo, descripcion, archivos, aceptar, onCambio 
     for (const f of Array.from(lista)) {
       const ext = "." + extension(f.name);
       if (ext === ".ppt") rechazados.push(`${f.name}: guárdelo como .pptx`);
+      else if (ext === ".xls") rechazados.push(`${f.name}: guárdelo como .xlsx`);
       else if (!aceptar.includes(ext)) rechazados.push(`${f.name}: formato no admitido`);
       else if (!archivos.some((a) => a.name.toLowerCase() === f.name.toLowerCase())) nuevos.push(f);
     }
@@ -84,7 +86,7 @@ export function ZonaArchivos({ titulo, descripcion, archivos, aceptar, onCambio 
         <Icono n="upload" size={22} />
         <span>Arrastre archivos o <u>examine</u></span>
         <small>{aceptar.join(" · ")}</small>
-        <input ref={entrada} type="file" multiple hidden accept={[...aceptar, ".ppt"].join(",")}
+        <input ref={entrada} type="file" multiple hidden accept={[...aceptar, ".ppt", ".xls"].join(",")}
           onChange={(e) => { agregar(e.target.files); e.target.value = ""; }} />
       </div>
       {aviso && <p className="aviso-error">{aviso}</p>}

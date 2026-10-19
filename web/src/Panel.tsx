@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, type Paso, type Trabajo } from "./api";
 import { Icono } from "./components";
+import { EnviarEstimador } from "./Estimador";
 
 const PASOS: { id: Paso; texto: string }[] = [
   { id: "fuentes", texto: "Leyendo documentos y referencias" },
@@ -132,6 +133,10 @@ export function ResultadoVista({ trabajo, onNuevo, textoNuevo = "Generar otro RF
         {trabajo.proveedor !== "demo" && !trabajo.tipo && <a href={api.archivo(trabajo.id, "analisis")}>Análisis por documento</a>}
         <a href={api.archivo(trabajo.id, "revision")}>Informe de revisión (.md)</a>
       </div>
+
+      {r.rfd_id != null && (
+        <EnviarEstimador rfdId={r.rfd_id} codigo={r.codigo} version={r.version ?? "0.1"} proyecto={r.proyecto} />
+      )}
 
       {r.word && (
         <div className="nota-revision"><Icono n="alert" size={16} /><span>No se revisó con Word: {r.word}</span></div>

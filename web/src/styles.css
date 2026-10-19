@@ -151,6 +151,7 @@ h1, h2, h3, h4, p { margin: 0; }
 .ext-pptx { background: #ffeadf; color: #c4501b; }
 .ext-pdf { background: #fde4e4; color: #b42318; }
 .ext-md { background: #e7f6ec; color: #1f7a3d; }
+.ext-xlsx, .ext-xlsm { background: #e3f4ea; color: #137333; }
 .chip-nombre { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chip-peso { color: var(--texto-3); font-size: 12px; }
 .chip-quitar, .boton-icono {
@@ -561,3 +562,12 @@ main[hidden] { display: none; }
 .version-chip.activa > button { color: var(--primario); font-weight: 600; }
 .version-chip .quitar { padding: 4px 8px 4px 2px; color: var(--texto-3); }
 .version-chip .quitar:hover { color: var(--error, #b42318); }
+
+/* Puente con el estimador de horas (vía Engram) */
+.puente-estimador { display: flex; flex-direction: column; gap: 6px; margin: 12px 0; padding: 10px 12px; border: 1px dashed var(--borde-fuerte); border-radius: 10px; background: var(--superficie-2); }
+.puente-cab { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.puente-cab a { color: var(--primario); font-size: 13px; }
+.puente-estado { color: var(--texto-2); font-size: 12px; }
+.puente-estado.ok { color: var(--ok); }
+.puente-estado.atencion { color: var(--atencion); }
+.puente-estado.error { color: var(--error); }

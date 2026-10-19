@@ -6,7 +6,7 @@ import { useMotor } from "./Motor";
 import { Progreso, ResultadoVista } from "./Panel";
 import { Reglas } from "./Reglas";
 
-const EXTENSIONES = [".txt", ".md", ".docx", ".pptx", ".pdf"];
+const EXTENSIONES = [".txt", ".md", ".docx", ".pptx", ".pdf", ".xlsx"];
 
 function Estado({ ok, texto, titulo }: { ok: boolean; texto: string; titulo?: string }) {
   return <span className={`pildora ${ok ? "ok" : "no"}`} title={titulo}><i />{texto}</span>;

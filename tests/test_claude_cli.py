@@ -18,7 +18,7 @@ import pytest
 from lxml import etree
 
 from generador_rfd import servidor
-from generador_rfd.fuentes import Fuente, cargar_fuentes
+from generador_rfd.fuentes import Fuente, cargar_fuentes, leer_documento
 from generador_rfd.modelo import analizar_fuentes, comando_claude, crear_prompt, temas_de_codigo
 from generador_rfd.pipeline import publicar, terminos_ajenos
 from generador_rfd.proyecto import inventario_repositorios
@@ -68,6 +68,35 @@ def test_lee_pdf_y_markdown(tmp_path):
     w.write(vacio)
     with pytest.raises(ValueError, match="OCR"):
         cargar_fuentes([], [vacio])
+
+
+def test_lee_excel_con_columnas_y_hojas_ocultas(tmp_path):
+    from openpyxl import Workbook
+
+    libro = Workbook()
+    hoja = libro.active
+    hoja.title = "Requerimientos"
+    hoja.append(["ID", "Requerimiento", "Prioridad", "Responsable"])
+    hoja.append(["RQ-01", "Consultar saldo", "Alta", "Equipo SAP"])
+    hoja.append(["RQ-02", "Exportar PDF", None, "Equipo portal"])
+    oculta = libro.create_sheet("Parámetros")
+    oculta.append(["Clave", "Valor"])
+    oculta.sheet_state = "hidden"
+    ruta = tmp_path / "matriz.xlsx"
+    libro.save(ruta)
+    fuentes = cargar_fuentes([], [ruta])
+    texto = fuentes[0].contenido
+    assert "H1: hoja «Requerimientos»" in texto and "H2: hoja «Parámetros» (oculta)" in texto
+    # La celda vacía de «Prioridad» conserva su columna: «Equipo portal» sigue siendo el responsable.
+    assert "H1F3: RQ-02 | Exportar PDF |  | Equipo portal" in texto
+    with pytest.raises(ValueError, match="guárdelo como .xlsx"):
+        leer_documento(_xls(tmp_path))
+
+
+def _xls(tmp_path):
+    ruta = tmp_path / "viejo.xls"
+    ruta.write_bytes(bytes([0xD0, 0xCF, 0x11, 0xE0]))
+    return ruta
 
 
 def test_transcripcion_opcional_si_hay_contexto():
@@ -522,3 +551,24 @@ def test_api_genera_word_con_varios_archivos(tmp_path, monkeypatch):
     assert word.status_code == 200 and word.content[:2] == b"PK"
     assert cliente.get(f"/api/trabajos/{id_}/archivo/analisis").status_code == 200
     assert (tmp_path / "RFD_TEST-API.revision.md").is_file()
+
+
+def test_excel_con_dimension_falsa_se_lee_completo(tmp_path):
+    import re
+    import zipfile
+
+    from openpyxl import Workbook
+
+    libro = Workbook()
+    for i in range(5):
+        libro.active.append([f"a{i}", f"b{i}"])
+    base = tmp_path / "base.xlsx"
+    libro.save(base)
+    ruta = tmp_path / "dim_a1.xlsx"
+    with zipfile.ZipFile(base) as origen, zipfile.ZipFile(ruta, "w") as destino:
+        for n in origen.namelist():
+            datos = origen.read(n)
+            if n == "xl/worksheets/sheet1.xml":
+                datos = re.sub(rb'<dimension ref="[^"]*"', b'<dimension ref="A1"', datos)
+            destino.writestr(n, datos)
+    assert "H1F5: a4 | b4" in leer_documento(ruta)

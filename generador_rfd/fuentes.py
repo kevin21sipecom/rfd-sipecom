@@ -9,7 +9,7 @@ from docx import Document
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
-EXTENSIONES = {".txt", ".md", ".docx", ".pptx", ".pdf"}
+EXTENSIONES = {".txt", ".md", ".docx", ".pptx", ".pdf", ".xlsx", ".xlsm"}
 MAX_CARACTERES = 120_000
 # Los modelos de las CLIs admiten contextos amplios (~4 caracteres por token); 120 000 queda para OpenCode.
 MAX_CARACTERES_CLAUDE = 450_000
@@ -94,8 +94,34 @@ def _leer_pdf(ruta: Path) -> str:
     return "\n".join(partes)
 
 
+def _leer_excel(ruta: Path) -> str:
+    """Cada hoja con su nombre y cada fila con marca H{hoja}F{fila}; celdas vacías omitidas.
+
+    Se leen los valores calculados (data_only): las fórmulas aparecen con su resultado. Las hojas ocultas
+    se incluyen y se marcan, porque en matrices internas suelen guardar datos de referencia."""
+    from openpyxl import load_workbook
+
+    libro = load_workbook(ruta, read_only=True, data_only=True)
+    partes: list[str] = []
+    for h, hoja in enumerate(libro.worksheets, 1):
+        # Algunos generadores declaran dimensión A1; en modo lectura openpyxl la respetaría y omitiría las demás filas.
+        hoja.reset_dimensions()
+        estado = "" if hoja.sheet_state == "visible" else " (oculta)"
+        partes.append(f"H{h}: hoja «{hoja.title}»{estado}")
+        for f, fila in enumerate(hoja.iter_rows(values_only=True), 1):
+            # Las celdas vacías conservan su lugar para que cada valor siga siendo el de su columna.
+            celdas = [" ".join(str(v).split()) if v is not None else "" for v in fila]
+            while celdas and not celdas[-1]:
+                celdas.pop()
+            if any(celdas):
+                partes.append(f"H{h}F{f}: {' | '.join(celdas)}")
+    libro.close()
+    return "\n".join(partes)
+
+
 # Markdown se lee como texto plano: los encabezados, tablas y listas ya son legibles para el modelo.
-_LECTORES = {".txt": _leer_txt, ".md": _leer_txt, ".docx": _leer_docx, ".pptx": _leer_pptx, ".pdf": _leer_pdf}
+_LECTORES = {".txt": _leer_txt, ".md": _leer_txt, ".docx": _leer_docx, ".pptx": _leer_pptx, ".pdf": _leer_pdf,
+             ".xlsx": _leer_excel, ".xlsm": _leer_excel}
 
 
 MAX_ESTILO = 60_000
@@ -108,10 +134,14 @@ def leer_documento(ruta: Path) -> str:
     sufijo = ruta.suffix.lower()
     if sufijo == ".ppt":
         raise ValueError(f"{ruta.name} usa el formato antiguo .ppt; ábralo en PowerPoint y guárdelo como .pptx.")
+    if sufijo == ".xls":
+        raise ValueError(f"{ruta.name} usa el formato antiguo .xls; ábralo en Excel y guárdelo como .xlsx.")
     if sufijo not in EXTENSIONES:
-        raise ValueError(f"Formato no admitido: {ruta.name}; use .txt, .md, .docx, .pptx o .pdf.")
+        raise ValueError(f"Formato no admitido: {ruta.name}; use .txt, .md, .docx, .pptx, .pdf o .xlsx.")
     contenido = _LECTORES[sufijo](ruta)
     if not contenido.strip():
+        if sufijo in (".xlsx", ".xlsm"):
+            raise ValueError(f"{ruta.name} no tiene celdas con texto o valores.")
         if sufijo == ".pdf":
             raise ValueError(f"{ruta.name} no tiene texto seleccionable (parece escaneado); aplíquele OCR o expórtelo a Word.")
         raise ValueError(f"El archivo no contiene texto extraíble: {ruta.name}")

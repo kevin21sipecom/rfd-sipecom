@@ -257,7 +257,7 @@ QUÉ EXTRAER (sé exhaustivo y concreto; copia literalmente identificadores, nom
 - escenarios: escenarios de negocio con su descripción (en presentaciones, uno por escenario).
 - dudas_y_contradicciones: inconsistencias DENTRO del documento (texto vs. tabla, códigos distintos para lo mismo, campos ambiguos, valores de ejemplo usados como regla) y datos que faltan para construir.
 - terminos_codigo: 3 a 6 términos para buscar en el código del sistema existente (entidades o funciones: cliente, contrato, pedido, precio…).
-- evidencias: ubicaciones que sustentan lo anterior, con el formato `{fuente.id} P12`, `{fuente.id} T3F2C1`, `{fuente.id} D4` o `{fuente.id} L8-L12`, usando sólo marcas que aparecen en el documento.
+- evidencias: ubicaciones que sustentan lo anterior, con el formato `{fuente.id} P12`, `{fuente.id} T3F2C1`, `{fuente.id} D4`, `{fuente.id} L8-L12`, `{fuente.id} H1F4` (hoja 1, fila 4 de un Excel), usando sólo marcas que aparecen en el documento.
 
 DOCUMENTO
 {fuente.para_prompt()}

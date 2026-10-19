@@ -159,7 +159,7 @@ El esfuerzo se pasa como `--effort` (claude, agy), `model_reasoning_effort` (cod
 
 ## Cómo se genera un RFD
 
-1. **Fuentes.** Cada archivo se convierte en texto con marcas de procedencia (`P12` párrafo, `T3F2C1` celda de tabla, `D4` diapositiva, `L8` línea, `Pg3L12` página y línea).
+1. **Fuentes.** Cada archivo se convierte en texto con marcas de procedencia (`P12` párrafo, `T3F2C1` celda de tabla, `D4` diapositiva, `L8` línea, `Pg3L12` página y línea, `H1F4` hoja 1 fila 4 de un Excel).
 2. **Análisis por documento.** Una llamada por fuente, en paralelo: referencias (códigos de especificación y versiones), servicios, datos de solicitud y respuesta, reglas, validaciones, mensajes, dependencias, escenarios, dudas internas y términos para buscar en el código.
 3. **Sistema existente.** Inventario de cada repositorio y fragmentos de código relacionados con los temas detectados.
 4. **Redacción.** Justificación, objetivo, alcance RF-xx, AS-IS, secciones transversales, una sección por interfaz (descripción, información intercambiada, referencia funcional, flujo y criterios de aceptación), escenarios, adecuaciones por componente, prerrequisitos, definiciones D-xx, restricciones, entregables, esfuerzo, anexos y preguntas para el cliente.

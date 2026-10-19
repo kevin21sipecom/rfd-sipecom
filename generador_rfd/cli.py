@@ -101,7 +101,7 @@ def parser() -> argparse.ArgumentParser:
     m = sub.add_parser("mejorar", help="Adapta un RFD guardado a las respuestas del cliente y crea la versión siguiente.")
     m.add_argument("--id", type=int, required=True, help="ID del RFD en el historial (vea `generador-rfd historial`).")
     m.add_argument("--cuestionario", type=Path, action="append", default=[], help="Cuestionario .docx respondido por el cliente.")
-    m.add_argument("--adjunto", type=Path, action="append", default=[], help="Acta, correo o aclaración del cliente (.txt, .md, .docx, .pptx, .pdf).")
+    m.add_argument("--adjunto", type=Path, action="append", default=[], help="Acta, correo o aclaración del cliente (.txt, .md, .docx, .pptx, .pdf, .xlsx).")
     m.add_argument("--proveedor", choices=PROVEEDORES, default="claude")
     m.add_argument("--modelo", default="")
     m.add_argument("--esfuerzo", default="")

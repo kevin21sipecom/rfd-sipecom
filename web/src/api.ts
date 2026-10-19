@@ -71,6 +71,7 @@ export interface Resultado {
   word: string | null;
   calidad: Calidad | null;
   rfd_id?: number;
+  proyecto?: string;
   version?: string;
   preguntas_cliente?: { id: string; tema: string; contexto: string; pregunta: string; relacion: string[] }[];
   cambios?: Cambio[];
@@ -175,6 +176,22 @@ export interface ContextoCodigo {
   caracteres: number;
 }
 
+/** Estado del puente con el estimador de horas (generador-tiempos) a través de Engram. */
+export interface Integracion {
+  engram: boolean;
+  engram_url: string;
+  estimador_url: string;
+  handoff: { version: string; enviado: string } | null;
+  estimacion: {
+    version: string;
+    total_horas_dev: number;
+    total_horas_proyecto: number;
+    aprobado: boolean;
+    url_estimacion: string;
+    estimado: string;
+  } | null;
+}
+
 async function pedir<T>(url: string, init?: RequestInit): Promise<T> {
   const r = await fetch(url, init);
   if (!r.ok) {
@@ -236,4 +253,7 @@ export const api = {
   restaurarRegla: (id: number) => pedir<Regla>(`/api/reglas/${id}/restaurar`, { method: "POST" }),
   eliminarRegla: (id: number) => pedir<{ ok: boolean }>(`/api/reglas/${id}`, { method: "DELETE" }),
   archivoRfd: (id: number, tipo: "docx" | "pdf" | "cuestionario" | "revision" | "json") => `/api/rfds/${id}/archivo/${tipo}`,
+  integracion: (codigo: string) => pedir<Integracion>(`/api/integracion?codigo=${encodeURIComponent(codigo)}`),
+  enviarEstimador: (id: number, proyecto = "") =>
+    pedir<{ ok: boolean; observacion: number; estimador_url: string }>(`/api/rfds/${id}/enviar-estimador`, json({ proyecto })),
 };

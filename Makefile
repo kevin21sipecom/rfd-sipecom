@@ -15,13 +15,15 @@ PORT ?= 2122
 PUERTO ?= $(PORT)
 MODELO ?= haiku
 PROVEEDOR ?= claude
+ENGRAM_PORT ?= 7437
+ESTIMADOR_PORT ?= 8000
 
 .DEFAULT_GOAL := help
 .NOTPARALLEL: dev start
 
 .PHONY: help install build dev start stop restart status test check clean rebuild \
-        dev-ui dev-backend doctor demo test-fast \
-        ayuda instalar sync compilar web web-dev ui ejecutar run up servidor server limpiar lint test-rapido
+        dev-ui dev-backend doctor demo test-fast engram \
+        ayuda instalar sync compilar web web-dev ui ejecutar run up servidor server api limpiar lint test-rapido
 
 # ==============================================================================
 # 1. Ayuda y Descubrimiento
@@ -35,9 +37,10 @@ help: ## Muestra este menu interactivo de comandos disponibles
 	@echo   make dev          - Inicia la aplicacion en http://127.0.0.1:$(PORT) y abre el navegador
 	@echo   make start        - Inicia el servidor sin abrir el navegador (modo servicio)
 	@echo   make dev-ui       - Inicia Vite en modo desarrollo para la interfaz web (web/)
+	@echo   make dev-backend  - Solo el backend FastAPI, sin navegador
 	@echo   make stop         - Detiene procesos que esten escuchando en el puerto $(PORT)
 	@echo   make restart      - Reinicia la aplicacion (stop seguido de dev)
-	@echo   make status       - Diagnostica herramientas (doctor) y valida el puerto $(PORT)
+	@echo   make status       - Diagnostica herramientas y valida puertos (app, Engram, estimador)
 	@echo   make test         - Ejecuta todas las pruebas unitarias (MODELO=$(MODELO))
 	@echo   make check        - Chequeo rapido de pruebas locales sin LLMs externos
 	@echo   make clean        - Borra caches (__pycache__, .pytest_cache) y temporales en salidas/
@@ -47,6 +50,7 @@ help: ## Muestra este menu interactivo de comandos disponibles
 	@echo   make doctor       - Comprueba CLIs, CodeGraph y plantilla (PROVEEDOR=$(PROVEEDOR))
 	@echo   make test-fast    - Pruebas rapidas sin llamadas a Claude ni a Codex
 	@echo   make demo         - Genera el RFD de demostracion en salidas/
+	@echo   make engram       - Asegura que Engram (puente con el estimador de horas) este activo
 	@echo ==============================================================================
 
 # ==============================================================================
@@ -86,7 +90,10 @@ dev-ui: ## Inicia servidor de desarrollo Vite con recarga rapida
 	@echo [*] Iniciando Vite en web/...
 	cd web && bun run dev
 
-dev-backend: start ## Alias de start
+dev-backend: start ## Solo el backend (sin navegador)
+
+engram: $(PY) ## Asegura que Engram este activo (lo inicia en segundo plano si hace falta)
+	@$(PY) -c "from generador_rfd import engram; ok = engram.asegurar_servidor(); print(('[OK] Engram activo en ' if ok else '[ALERTA] Engram no responde en ') + engram.ENGRAM_URL)"
 
 # ==============================================================================
 # 5. Control de Procesos y Estado
@@ -98,13 +105,8 @@ stop: ## Detiene procesos que ocupan el puerto configurado
 restart: stop dev ## Reinicia la aplicacion
 
 status: doctor ## Diagnostica prerequisitos y verifica disponibilidad del puerto
-	@echo [*] Verificando conectividad en http://127.0.0.1:$(PORT)...
-	@$(PYTHON) -c "import urllib.request; \
-	try: \
-		with urllib.request.urlopen('http://127.0.0.1:$(PORT)', timeout=2) as r: \
-			print(f'[OK] Servidor ACTIVO (Status: {r.status})'); \
-	except Exception as e: \
-		print(f'Servidor no responde en puerto $(PORT): {e}')"
+	@echo [*] Verificando puertos...
+	@$(PYTHON) -c "import socket; [print(('[OK] ' if socket.socket().connect_ex(('127.0.0.1', p)) == 0 else '[ALERTA] sin respuesta: ') + n + ' en puerto ' + str(p)) for n, p in (('Creador de RFD', $(PORT)), ('Engram', $(ENGRAM_PORT)), ('Estimador de horas', $(ESTIMADOR_PORT)))]"
 
 doctor: $(PY) ## Comprueba CLIs, CodeGraph y plantilla
 	$(PY) -m generador_rfd doctor --proveedor $(PROVEEDOR)
@@ -142,8 +144,9 @@ ui: dev-ui
 ejecutar: dev
 run: dev
 up: dev
-servidor: start
-server: start
+servidor: dev-backend
+server: dev-backend
+api: dev-backend
 limpiar: clean
 lint: check
 test-rapido: test-fast

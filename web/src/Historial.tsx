@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type PreguntaGuardada, type RfdDetalle, type RfdResumen, type Trabajo } from "./api";
 import { Icono, ZonaArchivos } from "./components";
+import { EnviarEstimador } from "./Estimador";
 import type { Motor } from "./Motor";
 import { PASOS_MEJORA, Progreso, ResultadoVista } from "./Panel";
 
-const EXTENSIONES = [".txt", ".md", ".docx", ".pptx", ".pdf"];
+const EXTENSIONES = [".txt", ".md", ".docx", ".pptx", ".pdf", ".xlsx"];
 
 interface Proyecto {
   clave: string;
@@ -234,6 +235,7 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
                 {detalle.archivos.cuestionario && <a className="boton" href={api.archivoRfd(detalle.id, "cuestionario")}><Icono n="download" size={15} /> Cuestionario</a>}
                 <button type="button" className="boton fantasma" onClick={() => api.abrirRfd(detalle.id, "carpeta")}><Icono n="folder" size={15} /></button>
               </div>
+              {detalle.archivos.docx && <EnviarEstimador key={detalle.id} rfdId={detalle.id} codigo={detalle.codigo} version={detalle.version} />}
               {proyecto && proyecto.registros.length > 1 && (
                 <div className="versiones" role="tablist" aria-label="Versiones del proyecto">
                   {proyecto.registros.map((r) => (

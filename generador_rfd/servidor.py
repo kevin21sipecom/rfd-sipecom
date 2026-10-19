@@ -16,11 +16,12 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from . import engram
 from .fuentes import EXTENSIONES
 from .modelo import MODELO_CLAUDE_DEFECTO
 from .motores import CLIS, catalogo, ejecutable
@@ -120,7 +121,8 @@ def _trabajo(id_: str, o: Opciones) -> None:
     try:
         r = generar_rfd(o, lambda paso, detalle: _actualizar(id_, paso=paso, detalle=detalle))
         rfd_id = _registrar(r, "generado", o.proveedor, o.modelo)
-        _actualizar(id_, estado="listo", paso="listo", fin=time.time(), uso=r.uso, resultado={**_resumen(r), "rfd_id": rfd_id},
+        _actualizar(id_, estado="listo", paso="listo", fin=time.time(), uso=r.uso,
+                    resultado={**_resumen(r), "rfd_id": rfd_id, "proyecto": str(o.proyecto or "")},
                     fuentes=[{"id": f.id, "categoria": f.categoria, "nombre": f.nombre, "caracteres": len(f.contenido)} for f in r.fuentes])
     except Exception as e:  # noqa: BLE001 - el error se muestra en la interfaz
         _actualizar(id_, estado="error", error=str(e), fin=time.time())
@@ -466,6 +468,53 @@ def crear_preguntas(rfd_id: int, proveedor: str = Form("claude"), modelo: str = 
     return {"id": id_}
 
 
+# ---------------------------------------------------------------- Puente con el estimador de horas (vía Engram)
+
+@app.get("/api/integracion")
+def integracion(codigo: str = "") -> dict[str, Any]:
+    activo = engram.disponible()
+    info: dict[str, Any] = {"engram": activo, "engram_url": engram.ENGRAM_URL, "estimador_url": engram.ESTIMADOR_URL,
+                            "handoff": None, "estimacion": None}
+    if activo and codigo.strip():
+        try:
+            info.update(engram.estado(codigo))
+        except engram.EngramNoDisponible:
+            info["engram"] = False
+    return info
+
+
+class PeticionEnvio(BaseModel):
+    proyecto: str = ""
+
+
+@app.post("/api/rfds/{rfd_id}/enviar-estimador")
+def enviar_estimador(rfd_id: int, peticion: Request, p: PeticionEnvio | None = None) -> dict[str, Any]:
+    """Publica el RFD en Engram para que el estimador lo descargue desde este servidor."""
+    try:
+        r = almacen().obtener(rfd_id)
+    except KeyError as e:
+        raise HTTPException(404, str(e)) from e
+    docx = Path(r["ruta_docx"]) if r["ruta_docx"] else None
+    if not docx or not docx.is_file():
+        raise HTTPException(409, "El Word de este RFD no existe en disco; vuelva a generarlo antes de enviarlo.")
+    d = r["datos"]
+    carga = {
+        "origen": "creador-rfd", "rfd_id": rfd_id, "codigo": r["codigo"], "cliente": r["cliente"], "titulo": r["titulo"],
+        "version": r["version"], "objetivo": d.get("objetivo", ""),
+        "requerimientos": [{"id": x["id"], "nombre": x["nombre"]} for x in d.get("requerimientos", [])],
+        "archivo": docx.name, "ruta_docx": str(docx),
+        "url_docx": f"{str(peticion.base_url).rstrip('/')}/api/rfds/{rfd_id}/archivo/docx",
+        "proyecto": (p.proyecto.strip() if p else ""), "enviado": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    if not engram.asegurar_servidor():
+        raise HTTPException(503, f"Engram no está activo en {engram.ENGRAM_URL}. Ejecute `engram serve` e intente de nuevo.")
+    try:
+        obs = engram.publicar_rfd(carga)
+    except engram.EngramNoDisponible as e:
+        raise HTTPException(503, str(e)) from e
+    return {"ok": True, "observacion": obs, "estimador_url": engram.ESTIMADOR_URL}
+
+
 # ---------------------------------------------------------------- Reglas del equipo
 
 class PeticionRegla(BaseModel):
@@ -538,6 +587,8 @@ def iniciar(puerto: int = PUERTO, abrir_navegador: bool = True) -> None:
 
     url = f"http://127.0.0.1:{puerto}"
     print(f"Generador de RFD en {url}  (Ctrl+C para detener)")
+    # Puente con el estimador: si Engram no está activo se lanza en segundo plano, sin bloquear el arranque.
+    threading.Thread(target=engram.asegurar_servidor, daemon=True).start()
     if abrir_navegador:
         threading.Timer(1.2, lambda: webbrowser.open(url)).start()
     uvicorn.run(app, host="127.0.0.1", port=puerto, log_level="warning")

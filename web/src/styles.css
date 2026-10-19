@@ -406,6 +406,9 @@ main[hidden] { display: none; }
 /* Historial */
 .contenido.historial { grid-template-columns: 300px minmax(0, 1fr) minmax(320px, 380px); max-width: 1500px; }
 .lista-rfds { position: sticky; top: 90px; align-self: start; max-height: calc(100vh - 110px); overflow-y: auto; display: flex; flex-direction: column; gap: 12px; padding-right: 4px; }
+.lista-rfds > * { flex: none; }  /* sin esto el botón y el buscador se aplastan al llenarse la lista */
+.contenido.historial > .columna-panel { max-height: calc(100vh - 110px); overflow-y: auto; padding-right: 4px; }  /* el botón de acción queda siempre alcanzable */
+.lista-preguntas { max-height: 75vh; overflow-y: auto; padding-right: 4px; }
 .lista-cab { display: flex; align-items: baseline; justify-content: space-between; }
 .lista-cab h2 { font-size: 15px; }
 .lista-cab span { color: var(--texto-3); font-size: 12px; }
@@ -467,7 +470,7 @@ main[hidden] { display: none; }
 .guardado.guardando { color: var(--texto-3); }
 @media (max-width: 1280px) {
   .contenido.historial { grid-template-columns: 260px minmax(0, 1fr); }
-  .contenido.historial > .columna-panel { grid-column: 1 / -1; position: static; }
+  .contenido.historial > .columna-panel { grid-column: 1 / -1; position: static; max-height: none; overflow: visible; }
 }
 @media (max-width: 860px) {
   .contenido.historial { grid-template-columns: 1fr; }

@@ -28,7 +28,6 @@ export default function App() {
   const [reglasAplicables, setReglasAplicables] = useState(0);
   const [rfdElegido, setRfdElegido] = useState<number | null>(null);
   const [publico, setPublico] = useState(false);
-  const [estilos, setEstilos] = useState<File[]>([]);
   const [avances, setAvances] = useState<File[]>([]);
   const [revisarWord, setRevisarWord] = useState(true);
   const [trabajo, setTrabajo] = useState<Trabajo | null>(null);
@@ -83,7 +82,6 @@ export default function App() {
     const f = new FormData();
     transcripciones.forEach((a) => f.append("transcripciones", a));
     contextos.forEach((a) => f.append("contextos", a));
-    estilos.forEach((a) => f.append("estilos", a));
     avances.forEach((a) => f.append("avances", a));
     Object.entries({ cliente, codigo, titulo, fecha, proyecto, enfoque, tipo_proyecto: tipo })
       .forEach(([k, v]) => f.append(k, v));
@@ -154,11 +152,6 @@ export default function App() {
                 aceptar={EXTENSIONES} onCambio={setAvances} />
               <p className="campo-ayuda">Se conserva lo ya redactado, se completa lo que falta y se imita la forma de trabajar del autor. Si contradice otras fuentes, queda registrado en «definiciones».</p>
             </div>
-            <div className="bloque-estilo">
-              <ZonaArchivos titulo="Referencias de estilo" descripcion="Opcional · RFD aprobados de otros proyectos" archivos={estilos}
-                aceptar={EXTENSIONES} onCambio={setEstilos} />
-              <p className="campo-ayuda">Sólo se imita su estructura, profundidad y forma de redactar. Su contenido no se incorpora: la revisión avisa si se filtran nombres o datos de la referencia.</p>
-            </div>
           </Tarjeta>
 
           <Tarjeta numero={2} titulo="Código del proyecto" ayuda="Opcional. Puede ser una carpeta con varios repositorios: se inventaría cada uno (stack, servicios, procedimientos) y CodeGraph aporta el código relacionado con cada interfaz."
@@ -227,7 +220,6 @@ export default function App() {
                   <li className={transcripciones.length ? "ok" : ""}><Icono n="check" size={14} />{transcripciones.length ? `${transcripciones.length} transcripción(es)` : "Sin transcripción (opcional)"}</li>
                   <li className={contextos.length ? "ok" : ""}><Icono n="check" size={14} />{contextos.length} documento(s) de contexto</li>
                   <li className={avances.length ? "ok" : ""}><Icono n="check" size={14} />{avances.length ? `${avances.length} RFD en avance a continuar` : "Sin RFD en avance (opcional)"}</li>
-                  <li className={estilos.length ? "ok" : ""}><Icono n="check" size={14} />{estilos.length ? `${estilos.length} referencia(s) de estilo` : "Sin referencia de estilo (opcional)"}</li>
                   <li className={proyecto.trim() ? "ok" : ""}><Icono n="check" size={14} />{proyecto.trim() ? "Código del proyecto incluido" : "Sin código del proyecto"}</li>
                   <li className={cliente && codigo ? "ok" : ""}><Icono n="check" size={14} />Cliente y código</li>
                   <li className={reglasAplicables ? "ok" : ""}><Icono n="check" size={14} />

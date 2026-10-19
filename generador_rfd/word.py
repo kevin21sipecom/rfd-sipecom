@@ -271,6 +271,37 @@ def _cuerpo(parrafos: list[etree._Element], tablas: list[etree._Element], d: dic
     def t(i: int, filas: list[list[str]], encabezado: list[str] | None = None) -> None:
         bloques.append(tabla_de(tablas[i], filas, encabezado))
 
+    def rotulo(nombre: str, descripcion: str) -> None:
+        if descripcion.strip():
+            bloques.append(parrafo_mixto(texto_normal, [(f"{nombre}: ", True), (descripcion, False)]))
+        else:
+            p(nombre, negrita=True)
+
+    def especificacion(r: dict) -> None:
+        """Por portal: definiciones generales, cada ventana con sus secciones y campos, y reglas de negocio."""
+        for v in r["vistas"]:
+            sufijo = f" ({v['portal']})" if v["portal"].strip() else ""
+            if v["definiciones_generales"]:
+                h3(f"Definiciones generales{sufijo}")
+                li(v["definiciones_generales"])
+            for ventana in v["ventanas"]:
+                h3(f"Definiciones de la ventana {ventana['nombre']}{sufijo}")
+                if ventana["descripcion"].strip():
+                    p(ventana["descripcion"])
+                for s in ventana["secciones"]:
+                    rotulo(s["nombre"], s["descripcion"])
+                    if s["campos"]:
+                        # La tabla del flujo (4 columnas) sirve de modelo: No. | Campo | Tipo | Descripción.
+                        t(3, [[str(i), c["nombre"], c["tipo"], c["descripcion"]] for i, c in enumerate(s["campos"], 1)],
+                          ["No.", "Campo", "Tipo", "Descripción"])
+            if v["reglas_negocio"]:
+                h3(f"Reglas de negocio{sufijo}")
+                li(v["reglas_negocio"])
+        if r["integraciones"]:
+            h3("Integraciones")
+            for x in r["integraciones"]:
+                rotulo(x["servicio"], x["descripcion"])
+
     # Capítulo 1
     h1(capitulo)
     h2("Justificación")
@@ -301,6 +332,7 @@ def _cuerpo(parrafos: list[etree._Element], tablas: list[etree._Element], d: dic
         for i, e in enumerate(r["elementos"], 1):
             p(f"{i}. {e['titulo']}", negrita=True)
             p(e["detalle"])
+        especificacion(r)
         if r["flujo"]:
             h3("Flujo propuesto")
             t(3, [[str(x["numero"]), x["actor"], x["componente"], x["accion"]] for x in r["flujo"]])

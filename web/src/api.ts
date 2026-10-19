@@ -82,7 +82,7 @@ export interface RfdResumen {
   version: string;
   padre_id: number | null;
   creado: string;
-  origen: "generado" | "mejorado" | "importado";
+  origen: "generado" | "mejorado" | "importado" | "en_avance" | "continuado";
   proveedor: string | null;
   modelo: string | null;
   calidad: number | null;
@@ -126,7 +126,7 @@ export type Paso = "cola" | "base" | "respuestas" | "fuentes" | "analisis" | "co
 
 export interface Trabajo {
   id: string;
-  tipo?: "mejora" | "preguntas";
+  tipo?: "mejora" | "preguntas" | "importacion" | "continuacion";
   estado: "en_curso" | "listo" | "error";
   paso: Paso;
   detalle?: string;
@@ -213,6 +213,8 @@ export const api = {
     return pedir<{ leidas: number; guardadas: number; preguntas: PreguntaGuardada[] }>(`/api/rfds/${id}/cuestionario`, { method: "POST", body: f });
   },
   mejorar: (id: number, datos: FormData) => pedir<{ id: string }>(`/api/rfds/${id}/mejorar`, { method: "POST", body: datos }),
+  importar: (datos: FormData) => pedir<{ id: string }>("/api/rfds/importar", { method: "POST", body: datos }),
+  continuar: (id: number, datos: FormData) => pedir<{ id: string }>(`/api/rfds/${id}/continuar`, { method: "POST", body: datos }),
   crearPreguntas: (id: number, datos: FormData) => pedir<{ id: string }>(`/api/rfds/${id}/preguntas`, { method: "POST", body: datos }),
   eliminarRfd: (id: number) => pedir<{ ok: boolean }>(`/api/rfds/${id}`, { method: "DELETE" }),
   abrirRfd: (id: number, tipo: "docx" | "pdf" | "carpeta" | "cuestionario") => pedir<{ ok: boolean }>(`/api/rfds/${id}/abrir?tipo=${tipo}`, { method: "POST" }),

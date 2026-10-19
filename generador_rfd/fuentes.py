@@ -9,7 +9,7 @@ from docx import Document
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
-EXTENSIONES = {".txt", ".md", ".docx", ".pptx", ".pdf"}
+EXTENSIONES = {".txt", ".md", ".docx", ".pptx", ".pdf", ".xlsx"}
 MAX_CARACTERES = 120_000
 # Claude y los modelos de Codex en la nube admiten contextos mucho mayores que los locales (~4 caracteres por token).
 MAX_CARACTERES_CLAUDE = 450_000
@@ -93,8 +93,52 @@ def _leer_pdf(ruta: Path) -> str:
     return "\n".join(partes)
 
 
+def _texto_celda(valor: object) -> str:
+    return " ".join(str(getattr(valor, "text", valor)).split())
+
+
+def _leer_xlsx(ruta: Path) -> str:
+    """Una línea por celda, citable como Hoja!A1. Las fórmulas se conservan porque son la lógica de cálculo que
+    el programador debe replicar; si Excel guardó su resultado se agrega como [valor: …]."""
+    from openpyxl import load_workbook
+
+    partes: list[str] = []
+    formulas = valores = None
+    try:
+        formulas = load_workbook(ruta, read_only=True)
+        valores = load_workbook(ruta, read_only=True, data_only=True)
+        for hoja in formulas.worksheets:
+            hoja.reset_dimensions()  # algunos exportadores escriben una <dimension> errónea y se perderían celdas
+            celdas = [(c.coordinate, c.value) for fila in hoja.iter_rows() for c in fila if c.value is not None]
+            es_formula = lambda v: _texto_celda(v).startswith("=")  # noqa: E731
+            guardados: dict[str, object] = {}
+            if any(es_formula(v) for _, v in celdas):
+                hoja_valores = valores[hoja.title]
+                hoja_valores.reset_dimensions()
+                guardados = {c.coordinate: c.value for fila in hoja_valores.iter_rows() for c in fila if c.value is not None}
+            for coordenada, valor in celdas:
+                texto = _texto_celda(valor)
+                if not texto:
+                    continue
+                if es_formula(valor) and coordenada in guardados:
+                    texto += f" [valor: {_texto_celda(guardados[coordenada])}]"
+                partes.append(f"{hoja.title}!{coordenada}: {texto}")
+    finally:
+        for libro in (formulas, valores):
+            if libro is not None:
+                libro.close()
+    return "\n".join(partes)
+
+
 # Markdown se lee como texto plano: los encabezados, tablas y listas ya son legibles para el modelo.
-_LECTORES = {".txt": _leer_txt, ".md": _leer_txt, ".docx": _leer_docx, ".pptx": _leer_pptx, ".pdf": _leer_pdf}
+_LECTORES = {
+    ".txt": _leer_txt,
+    ".md": _leer_txt,
+    ".docx": _leer_docx,
+    ".pptx": _leer_pptx,
+    ".pdf": _leer_pdf,
+    ".xlsx": _leer_xlsx,
+}
 
 
 MAX_ESTILO = 60_000
@@ -108,7 +152,7 @@ def leer_documento(ruta: Path) -> str:
     if sufijo == ".ppt":
         raise ValueError(f"{ruta.name} usa el formato antiguo .ppt; ábralo en PowerPoint y guárdelo como .pptx.")
     if sufijo not in EXTENSIONES:
-        raise ValueError(f"Formato no admitido: {ruta.name}; use .txt, .md, .docx, .pptx o .pdf.")
+        raise ValueError(f"Formato no admitido: {ruta.name}; use .txt, .md, .docx, .pptx, .pdf o .xlsx.")
     contenido = _LECTORES[sufijo](ruta)
     if not contenido.strip():
         if sufijo == ".pdf":
@@ -122,16 +166,19 @@ def cargar_fuentes(
     contextos: list[Path],
     estilos: list[Path] | None = None,
     limite: int = MAX_CARACTERES,
+    avances: list[Path] | None = None,
 ) -> list[Fuente]:
-    """Fuentes de contenido (F01…) y referencias de estilo (E01…), que no aportan hechos al RFD."""
+    """Fuentes de contenido (F01…), RFD en avance a continuar (A01…) y referencias de estilo (E01…), que no aportan hechos."""
     estilos = estilos or []
-    if not transcripciones and not contextos:
-        raise ValueError("Se requiere al menos un archivo: una transcripción o un documento de contexto.")
+    avances = avances or []
+    if not transcripciones and not contextos and not avances:
+        raise ValueError("Se requiere al menos un archivo: una transcripción, un documento de contexto o un RFD en avance.")
     archivos = [("transcripcion", p) for p in transcripciones] + [("contexto", p) for p in contextos]
-    nombres = [p.name.lower() for _, p in archivos + [("estilo", p) for p in estilos]]
+    nombres = [p.name.lower() for _, p in archivos + [("avance", p) for p in avances] + [("estilo", p) for p in estilos]]
     if len(nombres) != len(set(nombres)):
         raise ValueError("Los archivos deben tener nombres distintos para mantener referencias inequívocas.")
     fuentes = [Fuente(f"F{i:02}", r.name, c, leer_documento(r)) for i, (c, r) in enumerate(archivos, 1)]
+    fuentes += [Fuente(f"A{i:02}", r.name, "avance", leer_documento(r)) for i, r in enumerate(avances, 1)]
     total = sum(len(f.contenido) for f in fuentes)
     if total > limite:
         raise ValueError(

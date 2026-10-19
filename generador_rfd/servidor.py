@@ -27,7 +27,9 @@ from .fuentes import EXTENSIONES
 from .modelo import MODELO_CLAUDE_DEFECTO, MODELOS_CLAUDE, modelos_codex
 from .almacen import Almacen
 from .modelo import Uso, generar_preguntas
-from .pipeline import PLANTILLA, RAIZ, Opciones, OpcionesMejora, Resultado, generar as generar_rfd, mejorar, publicar
+from .pipeline import (PLANTILLA, RAIZ, Opciones, OpcionesImportacion, OpcionesMejora, Resultado, continuar,
+                       generar as generar_rfd, importar, leer_avance, mejorar, publicar)
+from . import prototipo
 from .proyecto import analizar_proyecto, herramientas
 from .reglas import SECCIONES, Regla, bloque_prompt
 from .revision import word_disponible
@@ -76,9 +78,14 @@ def _registrar(r: Resultado, origen: str, proveedor: str, modelo: str, padre_id:
     )
 
 
+RESERVADOS_WINDOWS = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
 def _nombre_seguro(nombre: str) -> str:
-    nombre = Path(nombre).name
-    return re.sub(r"[^\w.\- ]+", "_", nombre).strip() or "archivo"
+    nombre = re.sub(r"[^\w.\- ]+", "_", Path(nombre).name).strip().rstrip(". ")
+    if not nombre or nombre.split(".")[0].upper() in RESERVADOS_WINDOWS:
+        return f"archivo_{nombre}" if nombre else "archivo"
+    return nombre
 
 
 def _resumen(r: Resultado) -> dict[str, Any]:
@@ -209,6 +216,7 @@ async def generar(
     transcripciones: list[UploadFile] = File(default=[]),
     contextos: list[UploadFile] = File(default=[]),
     estilos: list[UploadFile] = File(default=[]),
+    avances: list[UploadFile] = File(default=[]),
     cliente: str = Form(...),
     codigo: str = Form(...),
     tipo_proyecto: str = Form("existente"),
@@ -224,8 +232,8 @@ async def generar(
 ) -> dict[str, str]:
     if not cliente.strip() or not codigo.strip():
         raise HTTPException(400, "Indique cliente y código del RFD.")
-    if not transcripciones and not contextos:
-        raise HTTPException(400, "Agregue al menos una transcripción o un documento de contexto.")
+    if not transcripciones and not contextos and not avances:
+        raise HTTPException(400, "Agregue al menos una transcripción, un documento de contexto o un RFD en avance.")
     id_ = uuid.uuid4().hex[:12]
     entradas = SALIDAS / "_entradas" / id_
     entradas.mkdir(parents=True, exist_ok=True)
@@ -240,7 +248,7 @@ async def generar(
 
     opciones = Opciones(
         transcripciones=await guardar(transcripciones), contextos=await guardar(contextos), estilos=await guardar(estilos),
-        cliente=cliente.strip(), codigo=codigo.strip(), tipo_proyecto=tipo_proyecto,
+        avances=await guardar(avances), cliente=cliente.strip(), codigo=codigo.strip(), tipo_proyecto=tipo_proyecto,
         titulo=titulo.strip() or None, fecha=fecha.strip() or date.today().strftime("%d/%m/%Y"),
         proveedor=proveedor, modelo=modelo.strip() or (MODELO_CLAUDE_DEFECTO if proveedor == "claude" else ""),
         esfuerzo=esfuerzo.strip() if proveedor == "codex" else "",
@@ -328,6 +336,7 @@ def rfd(rfd_id: int) -> dict[str, Any]:
         raise HTTPException(404, str(e)) from e
     d = r["datos"]
     docx = Path(r["ruta_docx"]) if r["ruta_docx"] else None
+    html_prototipo = _prototipo_html_rfd(r)
     return {
         **{k: r[k] for k in ("id", "codigo", "cliente", "titulo", "version", "padre_id", "creado", "origen", "proveedor", "modelo",
                              "calidad", "uso", "hallazgos")},
@@ -337,8 +346,9 @@ def rfd(rfd_id: int) -> dict[str, Any]:
         "cambios": d.get("cambios", []),
         "historial": d.get("historial", []),
         "preguntas": almacen().preguntas(rfd_id),
-        "archivos": {t: bool(docx and docx.with_suffix(suf).is_file()) for t, suf in
-                     [("docx", ".docx"), ("pdf", ".pdf"), ("cuestionario", ".cuestionario.docx"), ("revision", ".revision.md")]},
+        "archivos": {**{t: bool(docx and docx.with_suffix(suf).is_file()) for t, suf in
+                        [("docx", ".docx"), ("pdf", ".pdf"), ("cuestionario", ".cuestionario.docx"), ("revision", ".revision.md")]},
+                     "prototipo": bool(html_prototipo and html_prototipo.is_file())},
     }
 
 
@@ -373,6 +383,11 @@ async def cargar_cuestionario(rfd_id: int, archivo: UploadFile = File(...)) -> d
 def archivo_rfd(rfd_id: int, tipo: str) -> FileResponse:
     sufijos = {"docx": ".docx", "pdf": ".pdf", "cuestionario": ".cuestionario.docx", "revision": ".revision.md", "json": ".json"}
     r = almacen().obtener(rfd_id)
+    if tipo == "prototipo":
+        html = _prototipo_html_rfd(r)
+        if html is None or not html.is_file():
+            raise HTTPException(404, "El RFD no tiene un prototipo adjunto.")
+        return FileResponse(html, filename=html.name, media_type="text/html", headers={"Content-Security-Policy": CSP_PROTOTIPO})
     if tipo not in sufijos or not r["ruta_docx"]:
         raise HTTPException(404, "Archivo no disponible.")
     ruta = Path(r["ruta_docx"]).with_suffix(sufijos[tipo])
@@ -457,6 +472,91 @@ async def mejorar_rfd(
     return {"id": id_}
 
 
+@app.post("/api/rfds/importar")
+async def importar_rfd(
+    archivo: UploadFile = File(...),
+    cliente: str = Form(...),
+    codigo: str = Form(...),
+    titulo: str = Form(""),
+    tipo_proyecto: str = Form("existente"),
+    proveedor: str = Form("claude"),
+    modelo: str = Form(""),
+    esfuerzo: str = Form(""),
+) -> dict[str, str]:
+    """Registra en el historial un RFD a medio redactar (.docx) para continuarlo después."""
+    if not cliente.strip() or not codigo.strip():
+        raise HTTPException(400, "Indique cliente y código del RFD.")
+    id_ = _nuevo_trabajo(proveedor, modelo, esfuerzo, "importacion")
+    entradas = SALIDAS / "_entradas" / id_
+    entradas.mkdir(parents=True, exist_ok=True)
+    destino = entradas / _nombre_seguro(archivo.filename or "avance.docx")
+    try:
+        destino.write_bytes(await archivo.read())
+        leer_avance(destino)
+    except Exception as e:  # noqa: BLE001 - cualquier fallo de lectura debe liberar el trabajo, no dejarlo «en curso»
+        with _candado:
+            _trabajos.pop(id_, None)
+        raise HTTPException(400, str(e) if isinstance(e, ValueError) else "No se pudo leer el archivo cargado.") from e
+    o = OpcionesImportacion(
+        archivo=destino, salida_dir=SALIDAS, cliente=cliente.strip(), codigo=codigo.strip(), titulo=titulo.strip() or None,
+        tipo_proyecto=tipo_proyecto, proveedor=proveedor, modelo=_modelo_de(proveedor, modelo),
+        esfuerzo=esfuerzo.strip() if proveedor == "codex" else "", reglas=almacen().reglas_para(cliente),
+    )
+
+    def trabajo() -> None:
+        try:
+            r = importar(o, lambda paso, detalle: _actualizar(id_, paso=paso, detalle=detalle))
+            rfd_id = _registrar(r, "en_avance", o.proveedor, o.modelo)
+            _actualizar(id_, estado="listo", paso="listo", fin=time.time(), uso=r.uso, resultado={**_resumen(r), "rfd_id": rfd_id})
+        except Exception as e:  # noqa: BLE001
+            _actualizar(id_, estado="error", error=str(e), fin=time.time())
+
+    threading.Thread(target=trabajo, daemon=True).start()
+    return {"id": id_}
+
+
+@app.post("/api/rfds/{rfd_id}/continuar")
+async def continuar_rfd(
+    rfd_id: int,
+    adjuntos: list[UploadFile] = File(default=[]),
+    instruccion: str = Form(""),
+    proveedor: str = Form("claude"),
+    modelo: str = Form(""),
+    esfuerzo: str = Form(""),
+    revisar_word: bool = Form(True),
+) -> dict[str, str]:
+    """Nueva versión que conserva lo escrito y completa lo que falta; no necesita respuestas del cliente."""
+    try:
+        base = almacen().obtener(rfd_id)
+    except KeyError as e:
+        raise HTTPException(404, str(e)) from e
+    id_ = _nuevo_trabajo(proveedor, modelo, esfuerzo, "continuacion")
+    entradas = SALIDAS / "_entradas" / id_
+    entradas.mkdir(parents=True, exist_ok=True)
+    rutas = []
+    for a in adjuntos:
+        destino = entradas / _nombre_seguro(a.filename or "contexto")
+        destino.write_bytes(await a.read())
+        rutas.append(destino)
+    o = OpcionesMejora(
+        base=Path(base["ruta_docx"] or SALIDAS / f"RFD_{_nombre_seguro(base['codigo'])}.docx"), salida_dir=SALIDAS,
+        adjuntos=rutas, instruccion=instruccion.strip(), proveedor=proveedor, modelo=_modelo_de(proveedor, modelo),
+        esfuerzo=esfuerzo.strip() if proveedor == "codex" else "", revisar_word=revisar_word,
+        datos_base=base["datos"], analisis_base=base["analisis"], reglas=almacen().reglas_para(base["cliente"]),
+    )
+
+    def trabajo() -> None:
+        try:
+            r = continuar(o, lambda paso, detalle: _actualizar(id_, paso=paso, detalle=detalle))
+            nuevo_id = _registrar(r, "continuado", o.proveedor, o.modelo, padre_id=rfd_id)
+            _actualizar(id_, estado="listo", paso="listo", fin=time.time(), uso=r.uso, resultado={**_resumen(r), "rfd_id": nuevo_id})
+        except Exception as e:  # noqa: BLE001
+            _actualizar(id_, estado="error", error=str(e), fin=time.time())
+
+    threading.Thread(target=trabajo, daemon=True).start()
+    return {"id": id_}
+
+
 @app.post("/api/rfds/{rfd_id}/preguntas")
 def crear_preguntas(rfd_id: int, proveedor: str = Form("claude"), modelo: str = Form(""), esfuerzo: str = Form("")) -> dict[str, str]:
     """Para RFD anteriores a la sección de preguntas: las redacta sin modificar el documento."""
@@ -524,6 +624,222 @@ def editar_regla(regla_id: int, p: PeticionRegla) -> dict[str, Any]:
 def eliminar_regla(regla_id: int) -> dict[str, bool]:
     almacen().eliminar_regla(regla_id)
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- Prototipos: el cambio sobre el diseño del sistema original
+
+# Un turno de chat a la vez por prototipo: dos versiones simultáneas partirían de la misma «actual».
+_proto_ocupados: set[str] = set()
+RE_ARCHIVO_CAPTURA = re.compile(r"^(pantalla_\d{1,2}\.(?:png|html)|captura\.json|diseno\.json|estilos\.css)$")
+TIPOS_CAPTURA = {".png": "image/png", ".html": "text/plain; charset=utf-8", ".json": "application/json", ".css": "text/plain; charset=utf-8"}
+# La vista previa no puede pedir nada afuera ni acceder al origen de la aplicación.
+CSP_PROTOTIPO = ("sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                 "img-src data: blob:; font-src data:")
+
+
+@app.on_event("shutdown")
+def _detener_prototipos() -> None:
+    prototipo.GESTOR.detener_todos()
+
+
+def _raiz_prototipos() -> Path:
+    return SALIDAS / "_prototipos"
+
+
+def _carpeta_proto(id_: str) -> Path:
+    try:
+        return prototipo.carpeta_de(_raiz_prototipos(), id_)
+    except KeyError as e:
+        raise HTTPException(404, "Prototipo no encontrado.") from e
+
+
+def _rfd_vinculado(rfd_id: int | None) -> dict[str, Any] | None:
+    if rfd_id is None:
+        return None
+    try:
+        r = almacen().obtener(rfd_id)
+    except KeyError:
+        return None
+    return {"id": r["id"], "codigo": r["codigo"], "titulo": r["titulo"], "version": r["version"]}
+
+
+def _prototipo_html_rfd(r: dict[str, Any]) -> Path | None:
+    if not r["ruta_docx"]:
+        return None
+    return Path(r["ruta_docx"]).parent / f"RFD_{_nombre_seguro(r['codigo']).replace(' ', '_')}_prototipo.html"
+
+
+@app.get("/api/prototipos/detectar")
+def detectar_prototipo(ruta: str) -> dict[str, Any]:
+    try:
+        return {"comandos": prototipo.detectar_comandos(ruta)}
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+class PeticionPrototipo(BaseModel):
+    ruta: str
+    rfd_id: int | None = None
+
+
+@app.post("/api/prototipos")
+def crear_prototipo(p: PeticionPrototipo) -> dict[str, str]:
+    if p.rfd_id is not None:
+        try:
+            almacen().obtener(p.rfd_id)
+        except KeyError as e:
+            raise HTTPException(404, str(e)) from e
+    try:
+        return {"id": prototipo.crear_prototipo(_raiz_prototipos(), p.ruta, p.rfd_id)}
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.get("/api/prototipos")
+def prototipos() -> list[dict[str, Any]]:
+    filas = []
+    raiz = _raiz_prototipos()
+    for carpeta in sorted(raiz.iterdir(), key=lambda c: c.stat().st_mtime, reverse=True) if raiz.is_dir() else []:
+        if not (carpeta / "meta.json").is_file():
+            continue
+        meta = prototipo.leer_meta(carpeta)
+        filas.append({"id": meta["id"], "ruta": meta["ruta"], "creado": meta.get("creado"), "versiones": len(prototipo.versiones(carpeta)),
+                      "rfd": _rfd_vinculado(meta.get("rfd_id"))})
+    return filas
+
+
+@app.get("/api/prototipos/{id_}")
+def detalle_prototipo(id_: str) -> dict[str, Any]:
+    carpeta = _carpeta_proto(id_)
+    meta = prototipo.leer_meta(carpeta)
+    return {"id": meta["id"], "ruta": meta["ruta"], "creado": meta.get("creado"), "rfd": _rfd_vinculado(meta.get("rfd_id")),
+            "chat": prototipo.leer_chat(carpeta), "versiones": prototipo.versiones(carpeta),
+            "proceso": prototipo.GESTOR.estado(id_), "captura": {"pantallas": prototipo.pantallas_capturadas(carpeta / "captura")}}
+
+
+class PeticionLevantar(BaseModel):
+    comando: list[str] | str | None = None
+    cwd: str | None = None
+    url_esperada: str | None = None
+    url: str | None = None
+
+
+@app.post("/api/prototipos/{id_}/levantar")
+def levantar_prototipo(id_: str, p: PeticionLevantar) -> dict[str, Any]:
+    meta = prototipo.leer_meta(_carpeta_proto(id_))
+    try:
+        if p.url:
+            return prototipo.GESTOR.adoptar_url(id_, p.url)
+        proyecto = Path(meta["ruta"]).resolve()
+        cwd = Path(p.cwd).resolve() if p.cwd else proyecto
+        if cwd != proyecto and proyecto not in cwd.parents:
+            raise ValueError("La carpeta de ejecución debe estar dentro del proyecto.")
+        comando = prototipo.partir_comando(p.comando) if isinstance(p.comando, str) else (p.comando or [])
+        return prototipo.GESTOR.levantar(id_, comando, cwd, p.url_esperada)
+    except prototipo.ProcesoEnEjecucion as e:
+        raise HTTPException(409, str(e)) from e
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.post("/api/prototipos/{id_}/detener")
+def detener_prototipo(id_: str) -> dict[str, Any]:
+    _carpeta_proto(id_)
+    return prototipo.GESTOR.detener(id_)
+
+
+class PeticionCaptura(BaseModel):
+    rutas: list[str] = ["/"]
+
+
+@app.post("/api/prototipos/{id_}/capturar")
+def capturar_prototipo(id_: str, p: PeticionCaptura) -> dict[str, str]:
+    carpeta = _carpeta_proto(id_)
+    estado = prototipo.GESTOR.estado(id_)
+    if estado["estado"] != "activo" or not estado["url"]:
+        raise HTTPException(409, "Levante el proyecto o indique la URL donde ya está corriendo antes de capturarlo.")
+    trabajo_id = _nuevo_trabajo("", "", "", "captura")
+
+    def trabajo() -> None:
+        try:
+            _actualizar(trabajo_id, paso="captura", detalle=f"Capturando {len(p.rutas)} pantalla(s) de {estado['url']}")
+            pantallas = prototipo.capturar(estado["url"], p.rutas, carpeta / "captura")
+            _actualizar(trabajo_id, estado="listo", paso="listo", fin=time.time(), resultado={"pantallas": pantallas})
+        except Exception as e:  # noqa: BLE001 - el error se muestra en la interfaz
+            _actualizar(trabajo_id, estado="error", error=str(e), fin=time.time())
+
+    threading.Thread(target=trabajo, daemon=True).start()
+    return {"id": trabajo_id}
+
+
+@app.get("/api/prototipos/{id_}/captura/{nombre}")
+def archivo_captura(id_: str, nombre: str) -> FileResponse:
+    ruta = _carpeta_proto(id_) / "captura" / nombre
+    if not RE_ARCHIVO_CAPTURA.match(nombre) or not ruta.is_file():
+        raise HTTPException(404, "Archivo de captura no encontrado.")
+    return FileResponse(ruta, media_type=TIPOS_CAPTURA[ruta.suffix])
+
+
+@app.post("/api/prototipos/{id_}/mensaje")
+def mensaje_prototipo(id_: str, texto: str = Form(""), proveedor: str = Form("claude"), modelo: str = Form(""),
+                      esfuerzo: str = Form("")) -> dict[str, str]:
+    carpeta = _carpeta_proto(id_)
+    if not texto.strip():
+        raise HTTPException(400, "Escriba qué cambio quiere ver en el prototipo.")
+    with _candado:
+        if id_ in _proto_ocupados:
+            raise HTTPException(409, "El prototipo ya está generando una versión; espere a que termine.")
+        _proto_ocupados.add(id_)
+    trabajo_id = _nuevo_trabajo(proveedor, modelo, esfuerzo, "prototipo")
+    rfd_id = prototipo.leer_meta(carpeta).get("rfd_id")
+
+    def trabajo() -> None:
+        try:
+            uso = Uso()
+            datos = almacen().obtener(rfd_id)["datos"] if rfd_id is not None else None
+            r = prototipo.turno(carpeta, texto, proveedor=proveedor, modelo=_modelo_de(proveedor, modelo), directorio=carpeta, rfd=datos,
+                                esfuerzo=esfuerzo if proveedor == "codex" else "", uso=uso,
+                                progreso=lambda paso, detalle: _actualizar(trabajo_id, paso=paso, detalle=detalle))
+            _actualizar(trabajo_id, estado="listo", paso="listo", fin=time.time(), uso=uso.como_dict(), resultado=r)
+        except Exception as e:  # noqa: BLE001
+            _actualizar(trabajo_id, estado="error", error=str(e), fin=time.time())
+        finally:
+            with _candado:
+                _proto_ocupados.discard(id_)
+
+    threading.Thread(target=trabajo, daemon=True).start()
+    return {"id": trabajo_id}
+
+
+@app.get("/api/prototipos/{id_}/v/{version}")
+def version_prototipo(id_: str, version: int) -> HTMLResponse:
+    ruta = _carpeta_proto(id_) / f"v{version}.html"
+    if not ruta.is_file():
+        raise HTTPException(404, "Versión no encontrada.")
+    return HTMLResponse(ruta.read_text(encoding="utf-8"), headers={"Content-Security-Policy": CSP_PROTOTIPO})
+
+
+class PeticionAdjuntar(BaseModel):
+    version: int | None = None
+
+
+@app.post("/api/prototipos/{id_}/adjuntar-rfd")
+def adjuntar_prototipo(id_: str, p: PeticionAdjuntar) -> dict[str, Any]:
+    carpeta = _carpeta_proto(id_)
+    rfd_id = prototipo.leer_meta(carpeta).get("rfd_id")
+    if rfd_id is None:
+        raise HTTPException(400, "El prototipo no está vinculado a un RFD.")
+    disponibles = prototipo.versiones(carpeta)
+    if not disponibles:
+        raise HTTPException(409, "El prototipo aún no tiene versiones.")
+    version = p.version if p.version is not None else disponibles[-1]
+    if version not in disponibles:
+        raise HTTPException(404, "Versión no encontrada.")
+    destino = _prototipo_html_rfd(almacen().obtener(rfd_id))
+    if destino is None:
+        raise HTTPException(409, "El RFD no tiene un Word en disco junto al cual guardar el prototipo.")
+    shutil.copyfile(carpeta / f"v{version}.html", destino)
+    return {"ok": True, "version": version, "archivo": destino.name}
 
 
 if ESTATICOS.is_dir():

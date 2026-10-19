@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .fuentes import Fuente
-from .schema import SCHEMA, SCHEMA_ANALISIS, validar_contra, validar_estructura
+from .schema import SCHEMA, SCHEMA_ANALISIS, SCHEMA_DETALLE, validar_contra, validar_estructura
 
 SISTEMA_CLAUDE = (
     "Eres un analista funcional senior de SIPECOM que redacta RFD. Respondes sólo con el JSON del esquema. "
@@ -257,11 +257,12 @@ QUÉ EXTRAER (sé exhaustivo y concreto; copia literalmente identificadores, nom
 - sistemas, paises.
 - datos_solicitud y datos_respuesta: campos con su significado y obligatoriedad cuando conste.
 - reglas (negocio), validaciones (qué valida cada sistema), errores_y_mensajes (textos literales y comportamiento ante error).
+- En hojas de cálculo (marcas `Hoja!A1`), las fórmulas (`=...`) son lógica de cálculo: regístralas en `reglas` copiando la fórmula literal, qué calcula y qué celdas o columnas usa, para que el programador pueda replicarla. No las reduzcas al valor de ejemplo `[valor: …]`.
 - dependencias: lo que otros equipos o sistemas deben entregar.
 - escenarios: escenarios de negocio con su descripción (en presentaciones, uno por escenario).
 - dudas_y_contradicciones: inconsistencias DENTRO del documento (texto vs. tabla, códigos distintos para lo mismo, campos ambiguos, valores de ejemplo usados como regla) y datos que faltan para construir.
 - terminos_codigo: 3 a 6 términos para buscar en el código del sistema existente (entidades o funciones: cliente, contrato, pedido, precio…).
-- evidencias: ubicaciones que sustentan lo anterior, con el formato `{fuente.id} P12`, `{fuente.id} T3F2C1`, `{fuente.id} D4` o `{fuente.id} L8-L12`, usando sólo marcas que aparecen en el documento.
+- evidencias: ubicaciones que sustentan lo anterior, con el formato `{fuente.id} P12`, `{fuente.id} T3F2C1`, `{fuente.id} D4`, `{fuente.id} L8-L12` o `{fuente.id} Hoja!B3`, usando sólo marcas que aparecen en el documento.
 
 DOCUMENTO
 {fuente.para_prompt()}
@@ -327,6 +328,7 @@ GUIA_SECCIONES = """CÓMO REDACTAR CADA CAMPO (nivel esperado: el de un RFD apro
   · criterios_aceptacion: 4-9 criterios verificables con condición y resultado; incluye valores, códigos y mensajes literales de las fuentes, comportamiento ante error, casos límite y lo que el sistema NO debe hacer.
   · elementos: sólo para requerimientos tipo catálogo (escenarios de negocio): titulo numerado y detalle con condición contractual, comportamiento, aprobaciones y notificaciones. En ese caso el flujo puede quedar vacío.
   · evidencias: marcas de las fuentes que lo sustentan (F01 P12, F03 T2F4C2, F08 D5, F09 L30-L41).
+  · vistas e integraciones: especificación detallada por portal (ventanas, campos y reglas de negocio). La redacta un paso posterior, una opción por llamada: conserva tal cual las que ya existan y deja vacías las que falten.
 - componentes: id del alcance que cubre (p. ej. el último RF «Ajustar las pantallas, servicios y persistencia…»), titulo («Adecuaciones de los componentes existentes»), introducción breve + una fila por componente afectado: componente (nombre funcional), ubicacion (repositorios exactos del inventario) y adecuacion (qué se ajusta). Incluye repositorios duplicados o vacíos como observación.
 - prerrequisitos: introducción + 8-12 condiciones con su responsable (cliente, equipo del sistema externo, SIPECOM): personas, ambientes y accesos, contratos técnicos de las interfaces, datos maestros, datos y casos de prueba, versión autoritativa del código, ventanas de prueba.
 - definiciones: D-01… una por contradicción entre fuentes o decisión necesaria antes de construir. titulo corto; descripcion con lo que dice cada fuente y lo que se debe confirmar; evidencias de ambas partes. Compara activamente las fuentes entre sí: códigos de documentos, condiciones, obligatoriedad, límites, campos con doble significado, modalidad de mensajes, países y fases.
@@ -366,8 +368,9 @@ def crear_prompt(
     analisis: dict[str, dict[str, Any]] | None = None,
     reglas: str = "",
 ) -> str:
-    contenido = [f for f in fuentes if f.categoria != "estilo"]
+    contenido = [f for f in fuentes if f.categoria not in ("estilo", "avance")]
     estilos = [f for f in fuentes if f.categoria == "estilo"]
+    avances = [f for f in fuentes if f.categoria == "avance"]
     sin_reunion = "" if any(f.categoria == "transcripcion" for f in fuentes) else (
         "\nNo hay transcripción de reunión: los requisitos se derivan sólo de los documentos de contexto. "
         "Registra como pendiente lo que normalmente se confirmaría en una reunión.\n"
@@ -383,6 +386,16 @@ def crear_prompt(
             "\nREFERENCIAS DE ESTILO (sólo para imitar estructura, profundidad y forma de redactar. "
             "PROHIBIDO copiar hechos, cliente, sistemas, cifras, códigos o nombres de estas referencias)\n"
             + "\n\n".join(f.para_prompt() for f in estilos) + "\n"
+        )
+    bloque_avance = ""
+    if avances:
+        bloque_avance = (
+            "\nRFD EN AVANCE (trabajo previo del autor que debes CONTINUAR, no rehacer)\n"
+            "- Conserva literalmente lo ya redactado: textos, identificadores (RF-xx, códigos), numeración, nombres de campos y decisiones. No lo resumas ni lo parafrasees.\n"
+            "- Completa lo que falta: secciones vacías, con marcadores de plantilla o «por confirmar», usando las demás fuentes y siguiendo el criterio del autor.\n"
+            "- Absorbe su forma de trabajo: estructura, terminología, nivel de detalle, tono y orden de las secciones; imítalos en lo que agregues.\n"
+            "- Si una fuente contradice lo escrito por el autor, no lo cambies: regístralo en «definiciones». Lo que no puedas completar con datos, va a «pendientes».\n"
+            + "\n\n".join(f.para_prompt() for f in avances) + "\n"
         )
     return f"""Redacta un Requerimiento Funcional Detallado (RFD) completo para revisión humana. Devuelve ÚNICAMENTE el JSON del esquema.
 {sin_reunion}
@@ -403,16 +416,26 @@ Título indicado por el operador: {titulo or '(redáctalo en infinitivo a partir
 
 LINEAMIENTOS SIPECOM
 {lineamientos}
-{bloque_analisis}{bloque_estilo}
+{bloque_analisis}{bloque_avance}{bloque_estilo}
 FUENTES COMPLETAS
 {chr(10).join(chr(10) + f.para_prompt() for f in contenido)}
 """
 
 
-def prompt_correccion(datos: dict[str, Any], fallas: str, analisis: dict[str, dict[str, Any]] | None, reglas: str = "") -> str:
+def prompt_correccion(datos: dict[str, Any], fallas: str, analisis: dict[str, dict[str, Any]] | None, reglas: str = "",
+                      preservar: str = "") -> str:
     bloque_analisis = "\n".join(
         f"[{fid}] " + json.dumps(a, ensure_ascii=False) for fid, a in sorted((analisis or {}).items())
     )
+    bloque_autor = ""
+    if preservar.strip():
+        bloque_autor = f"""
+TEXTO DEL AUTOR (NO MODIFICAR)
+Una persona redactó lo siguiente y debe permanecer idéntico en el RFD: texto, IDs, numeración, nombres de campos y decisiones.
+- Corrige los criterios sólo en lo que la IA agregó o completó; deja intacto todo texto que provenga del autor.
+- Si un criterio no se cumple por texto del autor, no lo reescribas, alargues ni acortes: déjalo igual (se informará como hallazgo).
+{preservar}
+"""
     return f"""Eres el revisor editorial de SIPECOM. Corrige el RFD en JSON para que alcance el nivel narrativo del RFD de referencia aprobado. Devuelve el JSON COMPLETO con el mismo esquema.
 
 {INTEGRIDAD}{_reglas(reglas)}
@@ -432,7 +455,7 @@ CÓMO CORREGIR
 
 ANÁLISIS DE LAS FUENTES (datos verificables para completar)
 {bloque_analisis or '(sin análisis)'}
-
+{bloque_autor}
 RFD ACTUAL
 {json.dumps({k: v for k, v in datos.items() if k not in ("version", "historial")}, ensure_ascii=False)}
 """
@@ -440,8 +463,8 @@ RFD ACTUAL
 
 def corregir_rfd(*, datos: dict[str, Any], fallas: str, analisis: dict[str, dict[str, Any]] | None, proveedor: str,
                  modelo: str, directorio_salida: Path, uso: Uso | None = None, esfuerzo: str = "",
-                 tiempo_limite: int = 2400, reglas: str = "") -> dict[str, Any]:
-    nuevo = invocar(proveedor=proveedor, modelo=modelo, prompt=prompt_correccion(datos, fallas, analisis, reglas), esquema=SCHEMA,
+                 tiempo_limite: int = 2400, reglas: str = "", preservar: str = "") -> dict[str, Any]:
+    nuevo = invocar(proveedor=proveedor, modelo=modelo, prompt=prompt_correccion(datos, fallas, analisis, reglas, preservar), esquema=SCHEMA,
                     directorio=directorio_salida, tiempo=tiempo_limite, uso=uso, esfuerzo=esfuerzo)
     return _ajustar(nuevo, datos["cliente"], datos["codigo"], datos["tipo_proyecto"], datos["fecha"], datos["titulo"])
 
@@ -489,6 +512,97 @@ def adaptar_rfd(*, datos: dict[str, Any], respuestas: list[dict[str, str]], adju
     return _ajustar(nuevo, datos["cliente"], datos["codigo"], datos["tipo_proyecto"], datos["fecha"], datos["titulo"])
 
 
+def prompt_continuacion(datos: dict[str, Any], contexto: list[Fuente], instruccion: str, reglas: str = "") -> str:
+    bloque_contexto = "\n\n".join(f.para_prompt() for f in contexto) or "(sin documentos adicionales)"
+    base = {k: v for k, v in datos.items() if k not in ("version", "historial")}
+    return f"""Eres el analista funcional de SIPECOM. Una persona dejó este RFD a medio redactar y debes CONTINUARLO, no rehacerlo. Devuelve el JSON COMPLETO con el mismo esquema.
+
+{INTEGRIDAD}{_reglas(reglas)}
+
+REGLAS DE CONTINUACIÓN
+- Conserva literalmente todo lo ya redactado por el autor: textos, párrafos, criterios, flujos, evidencias, orden, numeración, IDs (RF-xx, D-xx, P-xx), nombres de campos y decisiones. No lo resumas, no lo parafrasees ni lo «mejores».
+- Completa sólo lo que falta: secciones vacías, con marcadores de plantilla, «por estimar», «por designar», «pendiente» o «por confirmar». Usa el contexto adicional y las instrucciones; si no hay datos para completarlo, déjalo como está y agrégalo a «pendientes» con su motivo.
+- Absorbe la forma de trabajo del autor: estructura, terminología, nivel de detalle, tono y orden de las secciones; imítalos en lo que agregues. Un requerimiento nuevo sigue la numeración RF-xx siguiente, con su flujo y criterios.
+- Si el contexto adicional contradice lo escrito por el autor, no lo cambies: regístralo en «definiciones» (D-xx siguiente) con lo que dice cada parte. Una definición existente no se elimina.
+- No elimines requerimientos, preguntas ni definiciones del autor. Agrega preguntas a «preguntas_cliente» sólo para vacíos que no puedas completar.
+- Registra en «cambios» una entrada por cada sección que completes o agregues: pregunta («Continuación»), sección afectada (p. ej. «2.4 RF-02 criterios») y el cambio en una oración. «cambios» describe sólo esta continuación.
+- Las evidencias de lo que agregues usan la marca del documento adicional (C01 P3) o «RFD» si proviene de lo ya escrito.
+- Lo que completes mantiene el nivel narrativo del documento: párrafos completos, criterios en voz normativa («deberá») con condición y resultado.
+
+{GUIA_SECCIONES}
+
+INSTRUCCIÓN DEL USUARIO (en qué enfocarte o qué falta)
+{instruccion.strip() or "(sin instrucción)"}
+
+DOCUMENTOS ADICIONALES (contexto para completar)
+{bloque_contexto}
+
+RFD EN AVANCE (versión {datos.get('version', '0.1')})
+{json.dumps(base, ensure_ascii=False)}
+"""
+
+
+def continuar_rfd(*, datos: dict[str, Any], contexto: list[Fuente], instruccion: str, proveedor: str, modelo: str,
+                  directorio_salida: Path, uso: Uso | None = None, esfuerzo: str = "",
+                  tiempo_limite: int = 2400, reglas: str = "") -> dict[str, Any]:
+    nuevo = invocar(proveedor=proveedor, modelo=modelo, prompt=prompt_continuacion(datos, contexto, instruccion, reglas), esquema=SCHEMA,
+                    directorio=directorio_salida, tiempo=tiempo_limite, uso=uso, esfuerzo=esfuerzo)
+    return _ajustar(nuevo, datos["cliente"], datos["codigo"], datos["tipo_proyecto"], datos["fecha"], datos["titulo"])
+
+
+def prompt_detalle(datos: dict[str, Any], requerimiento: dict[str, Any], fuentes: list[Fuente],
+                   analisis: dict[str, dict[str, Any]] | None = None, instruccion: str = "", reglas: str = "") -> str:
+    """Especificación de UNA opción: cabe completa en la respuesta en vez de comprimirse junto con todo el RFD."""
+    opcion = {k: requerimiento[k] for k in ("id", "nombre", "parrafos", "referencia", "flujo", "criterios_aceptacion")}
+    otras = "\n".join(f"- {r['id']} {r['nombre']}" for r in datos["requerimientos"] if r["id"] != requerimiento["id"]) or "(ninguna)"
+    modelo_autor = "\n\n".join(f"[{s['titulo']}]\n" + "\n".join(s["parrafos"]) for s in datos["secciones_generales"]) or "(sin secciones)"
+    bloque_analisis = "\n".join(f"[{fid}] " + json.dumps(a, ensure_ascii=False) for fid, a in sorted((analisis or {}).items()))
+    return f"""Eres el analista funcional de SIPECOM. Redacta la especificación funcional detallada de UN solo requerimiento del RFD, al nivel de un documento con pantallas listo para construir. Devuelve ÚNICAMENTE el JSON del esquema.
+
+{INTEGRIDAD}{_reglas(reglas)}
+
+QUÉ REDACTAR
+- vistas: una por portal o perfil con pantallas propias (p. ej. «Portal Público», «Portal Administrativo»). Si un perfil sólo agrega columnas o campos (p. ej. el usuario de Tesorería frente al usuario interno), descríbelo dentro de la misma vista: «Para los usuarios de Tesorería: se agregará…».
+  · definiciones_generales: 3-8 enunciados de lo que la opción permite («Permitirá al proveedor consultar…», «El usuario podrá descargar… en formato…»).
+  · ventanas: la principal (nombre «principal») y cada ventana emergente (p. ej. «Detalle», «Detalle de pago»). descripcion enumera las secciones que la componen. Cada sección (Panel de filtros, Exportación de resultados, Resumen o indicadores, Matriz de resultados, Información complementaria…) tiene descripción y campos: nombre exacto, tipo (Lista, Texto, Número, Fecha, Moneda, Botón, Enlace; «(calculado)» si lo calcula el portal) y descripción con origen del dato (SAP, SRI, archivo, portal), formato, fórmula de cálculo, valores posibles y en qué perfiles se ve.
+  · reglas_negocio: 10-40 reglas en voz normativa («deberá», «no deberá», «podrá»): estados y cómo se determinan, cálculos, relaciones entre documentos, visibilidad por perfil, descargas y su disponibilidad, exportación, exclusiones y lo que el portal NO hace. Cada definición tomada en reunión es una regla.
+- integraciones: un servicio por fuente de datos o documento descargable que la opción necesita, con lo que debe retornar.
+- secciones_reemplazadas: títulos EXACTOS de «secciones_generales» que sean un resumen breve de ESTA misma opción y queden superados por tu especificación. Nunca incluyas una sección del autor que ya tenga el detalle (ventanas, campos y reglas) ni secciones de otras opciones.
+- Si las secciones del RFD ya contienen la especificación detallada de esta opción, devuelve vistas e integraciones vacías: no la dupliques.
+- Usa sólo hechos de las fuentes y del RFD; lo que no conste no se inventa ni se rellena con «por confirmar».
+- Español formal, tercera persona, sin marcas de fuente (F01, C01 P3) en los textos.
+
+MODELO DE DETALLE DEL AUTOR (secciones ya redactadas: imita su estructura, profundidad y terminología; no copies hechos de otra opción salvo que también apliquen a ésta)
+{modelo_autor}
+
+OPCIÓN A DETALLAR
+{json.dumps(opcion, ensure_ascii=False)}
+
+OTRAS OPCIONES DEL RFD (no las detalles aquí)
+{otras}
+
+INSTRUCCIÓN DEL USUARIO
+{instruccion.strip() or "(sin instrucción)"}
+
+ANÁLISIS DE LAS FUENTES
+{bloque_analisis or '(sin análisis)'}
+
+FUENTES COMPLETAS
+{chr(10).join(chr(10) + f.para_prompt() for f in fuentes) or '(sin fuentes adicionales)'}
+"""
+
+
+def detallar_requerimiento(*, datos: dict[str, Any], requerimiento: dict[str, Any], fuentes: list[Fuente],
+                           analisis: dict[str, dict[str, Any]] | None, proveedor: str, modelo: str, directorio_salida: Path,
+                           uso: Uso | None = None, esfuerzo: str = "", tiempo_limite: int = 1800, reglas: str = "",
+                           instruccion: str = "") -> dict[str, Any]:
+    respuesta = invocar(proveedor=proveedor, modelo=modelo, esquema=SCHEMA_DETALLE, directorio=directorio_salida,
+                        prompt=prompt_detalle(datos, requerimiento, fuentes, analisis, instruccion, reglas),
+                        tiempo=tiempo_limite, uso=uso, esfuerzo=esfuerzo)
+    validar_contra(respuesta, SCHEMA_DETALLE, f"detalle de {requerimiento['id']}")
+    return respuesta
+
+
 def generar_preguntas(*, datos: dict[str, Any], analisis: dict[str, dict[str, Any]] | None, proveedor: str, modelo: str,
                       directorio_salida: Path, uso: Uso | None = None, esfuerzo: str = "",
                       reglas: str = "") -> list[dict[str, Any]]:
@@ -525,6 +639,7 @@ def reconstruir_rfd(*, texto: str, cliente: str, codigo: str, tipo_proyecto: str
 {INTEGRIDAD}
 - Transcribe fielmente: no resumas, no mejores la redacción, no agregues requerimientos ni criterios.
 - Cada sección del Capítulo 2 con «Flujo propuesto» es un requerimiento; usa el ID RF-xx de la tabla de alcance que le corresponda.
+- Las subsecciones «Definiciones generales (<portal>)», «Definiciones de la ventana <nombre> (<portal>)» y «Reglas de negocio (<portal>)» de un requerimiento van en sus «vistas» (los campos de cada tabla, con su tipo y descripción); su subsección «Integraciones», en «integraciones». Si no existen, quedan vacías.
 - La tabla de adecuaciones va en «componentes»; «Definiciones requeridas» en «definiciones»; «Preguntas para el cliente» en «preguntas_cliente».
 - Los anexos «F-xx — nombre» y su uso van en «anexos». Si no hay evidencias explícitas, usa la marca «RFD» seguida de la sección (p. ej. «RFD 2.3»).
 - «Por estimar», «Por designar» y «Pendiente» equivalen a null o cadena vacía.

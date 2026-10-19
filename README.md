@@ -42,7 +42,9 @@ Redactar un RFD a partir de varias especificaciones, actas y del sistema actual 
 
 | Área | Detalle |
 | --- | --- |
-| **Entradas** | `.txt`, `.md`, `.docx`, `.pptx` (texto, tablas y notas) y `.pdf` (texto por página). Varias transcripciones y documentos de contexto; la transcripción es opcional. |
+| **Entradas** | `.txt`, `.md`, `.docx`, `.pptx` (texto, tablas y notas), `.pdf` (texto por página) y `.xlsx` (cada celda citada como `Hoja!A1`; las fórmulas se conservan como reglas de cálculo para replicarlas). Varias transcripciones y documentos de contexto; la transcripción es opcional. |
+| **RFD en avance** | Un RFD a medio redactar (cualquier formato admitido) que la IA continúa: conserva lo ya escrito, completa secciones vacías o por confirmar con las demás fuentes y adopta la estructura y terminología del autor. Las contradicciones con otras fuentes se registran, no se sobrescriben. CLI: `--avance`. |
+| **Importar y continuar** | Un RFD en avance (.docx) se importa al historial, marcado «en avance» y con el Word original enlazado. «Continuar» crea la versión siguiente: conserva literalmente lo escrito, completa sólo lo que falta con contexto adicional y una instrucción opcional, y no necesita respuestas del cliente. La revisión editorial no puede reescribir el texto del autor: lo que no cumple la rúbrica se informa como hallazgo. CLI: `importar`, `continuar`. |
 | **Referencias de estilo** | RFD aprobados de otros proyectos que sólo orientan estructura y redacción; la revisión avisa si se filtran nombres o datos. |
 | **Código existente** | Inventario de una carpeta con varios repositorios (stack, controladores, componentes, servicios, procedimientos almacenados) y código relacionado vía **CodeGraph** o **Repomix**. |
 | **Motores** | Claude Code CLI (Sonnet, Opus, Fable, Haiku), Codex CLI (catálogo y nivel de razonamiento) y modelos locales de Ollama o LM Studio. Informa tokens y costo. |
@@ -186,6 +188,13 @@ generador-rfd reglas --agregar "Cada RF incluye un criterio de timeout" --tipo e
 3. **Mejorar a vX.Y** adapta el RFD: conserva todo lo no afectado, elimina las definiciones resueltas, cierra las preguntas respondidas y sólo agrega preguntas si una respuesta abre un vacío. Cada cambio queda en el registro y la versión se suma al historial del Word.
 4. La nueva versión pasa por la rúbrica y la revisión con Word; se avisa si una respuesta no figura en los cambios o si se eliminó un RF.
 
+## Continuar un RFD en avance
+
+1. En **Historial y mejoras**, **Importar proyecto en avance** recibe el `.docx`, el cliente y el código. El modelo sólo reconstruye su estructura; el Word original queda enlazado y la entrada figura como «en avance».
+2. En el detalle del RFD, **Continuar** admite documentos de contexto opcionales y una instrucción corta («qué falta o en qué enfocarte»).
+3. La IA conserva literalmente lo escrito (textos, IDs, numeración, campos y decisiones), completa secciones vacías, marcadores y «por confirmar», imita la estructura y terminología del autor, registra las contradicciones en *definiciones* y lo que no pueda completar en *pendientes*.
+4. Se crea una versión nueva del mismo proyecto; la anterior queda intacta. La revisión editorial recibe el texto del autor y sólo puede ajustar lo que la IA agregó; los criterios que el texto original no cumple aparecen en el informe como `calidad_texto_autor`. Lo mismo vale al generar con un RFD en avance como fuente.
+
 ## Línea de comandos
 
 ```powershell
@@ -200,12 +209,14 @@ generador-rfd generar `
 
 generador-rfd historial
 generador-rfd mejorar --id 6 --cuestionario .\respuestas\cuestionario.docx --adjunto .\respuestas\acta.pdf
+generador-rfd importar .\avance\RFD_parcial.docx --cliente "Cliente" --codigo "RFD-002"
+generador-rfd continuar --id 7 --contexto .\especificaciones\interfaz-clientes.docx --instruccion "Completa los criterios de RF-03 y el esfuerzo"
 generador-rfd contexto-codigo --proyecto C:\ruta\al\proyecto --enfoque "registro de pedidos"
 generador-rfd renderizar --datos .\ejemplos\rfd_demo.json --salida .\salidas\RFD_DEMO.docx
 generador-rfd doctor --proveedor codex
 ```
 
-`--transcripcion`, `--contexto`, `--estilo` y `--adjunto` se pueden repetir; `--sin-word` omite la revisión con Word; `--publico` bloquea el Word si quedan pendientes o datos sin confirmar.
+`--transcripcion`, `--contexto` (también en `continuar`), `--estilo` y `--adjunto` se pueden repetir; `--sin-word` omite la revisión con Word; `--publico` bloquea el Word si quedan pendientes o datos sin confirmar.
 
 ## Estructura del proyecto
 

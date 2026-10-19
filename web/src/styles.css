@@ -456,6 +456,10 @@ main[hidden] { display: none; }
 .pregunta-texto { margin: 4px 0 8px; font-size: 13.5px; font-weight: 560; }
 .pregunta-item textarea { width: 100%; resize: vertical; min-height: 44px; padding: 8px 10px; border: 1px solid var(--borde-fuerte); border-radius: 8px;
   background: var(--superficie); color: var(--texto); font: inherit; font-size: 13px; }
+.campo textarea { width: 100%; resize: vertical; min-height: 64px; padding: 9px 11px; border: 1px solid var(--borde-fuerte); border-radius: 10px;
+  background: var(--superficie); color: var(--texto); font: inherit; font-size: 13px; }
+.campo textarea:focus { outline: none; border-color: var(--primario); box-shadow: 0 0 0 3px var(--primario-suave); }
+.rejilla-1 { display: grid; gap: 14px; }
 .pregunta-item textarea:focus { outline: none; border-color: var(--primario); box-shadow: 0 0 0 3px var(--primario-suave); }
 .guardado { position: absolute; right: 14px; bottom: 6px; font-size: 11px; color: var(--ok); }
 .guardado.error { color: var(--error); }

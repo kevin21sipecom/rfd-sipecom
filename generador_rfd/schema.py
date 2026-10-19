@@ -64,6 +64,8 @@ VISTA = obj(
                 {
                     "nombre": STRING,
                     "descripcion": STRING,
+                    # Maqueta o captura que muestra la ventana (img_NN de la carpeta de UI del RFD); vacía si no hay.
+                    "imagen": STRING,
                     "secciones": arr(
                         obj(
                             {
@@ -238,6 +240,9 @@ def normalizar(datos: dict[str, Any]) -> dict[str, Any]:
     for r in datos.get("requerimientos", []):
         r.setdefault("vistas", [])
         r.setdefault("integraciones", [])
+        for v in r["vistas"]:
+            for ventana in v.get("ventanas", []):
+                ventana.setdefault("imagen", "")
     return datos
 
 

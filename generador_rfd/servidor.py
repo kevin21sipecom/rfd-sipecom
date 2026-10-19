@@ -678,21 +678,27 @@ def detectar_prototipo(ruta: str) -> dict[str, Any]:
 
 
 class PeticionPrototipo(BaseModel):
-    ruta: str
+    ruta: str = ""
     rfd_id: int | None = None
+    modo: str = "proyecto"
 
 
 @app.post("/api/prototipos")
 def crear_prototipo(p: PeticionPrototipo) -> dict[str, str]:
+    base = None
     if p.rfd_id is not None:
         try:
-            almacen().obtener(p.rfd_id)
+            base = almacen().obtener(p.rfd_id)
         except KeyError as e:
             raise HTTPException(404, str(e)) from e
     try:
-        return {"id": prototipo.crear_prototipo(_raiz_prototipos(), p.ruta, p.rfd_id)}
+        id_ = prototipo.crear_prototipo(_raiz_prototipos(), p.ruta, p.rfd_id, p.modo)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
+    # En el modo documento las maquetas salen del Word del RFD (el original del autor si fue importado).
+    if p.modo == "documento" and base and base["ruta_docx"] and Path(base["ruta_docx"]).is_file():
+        prototipo.agregar_imagenes(_raiz_prototipos() / id_, Path(base["ruta_docx"]))
+    return {"id": id_}
 
 
 @app.get("/api/prototipos")
@@ -703,8 +709,8 @@ def prototipos() -> list[dict[str, Any]]:
         if not (carpeta / "meta.json").is_file():
             continue
         meta = prototipo.leer_meta(carpeta)
-        filas.append({"id": meta["id"], "ruta": meta["ruta"], "creado": meta.get("creado"), "versiones": len(prototipo.versiones(carpeta)),
-                      "rfd": _rfd_vinculado(meta.get("rfd_id"))})
+        filas.append({"id": meta["id"], "modo": meta.get("modo", "proyecto"), "ruta": meta["ruta"], "creado": meta.get("creado"),
+                      "versiones": len(prototipo.versiones(carpeta)), "rfd": _rfd_vinculado(meta.get("rfd_id"))})
     return filas
 
 
@@ -712,9 +718,35 @@ def prototipos() -> list[dict[str, Any]]:
 def detalle_prototipo(id_: str) -> dict[str, Any]:
     carpeta = _carpeta_proto(id_)
     meta = prototipo.leer_meta(carpeta)
-    return {"id": meta["id"], "ruta": meta["ruta"], "creado": meta.get("creado"), "rfd": _rfd_vinculado(meta.get("rfd_id")),
-            "chat": prototipo.leer_chat(carpeta), "versiones": prototipo.versiones(carpeta),
+    return {"id": meta["id"], "modo": meta.get("modo", "proyecto"), "ruta": meta["ruta"], "creado": meta.get("creado"),
+            "rfd": _rfd_vinculado(meta.get("rfd_id")), "chat": prototipo.leer_chat(carpeta), "versiones": prototipo.versiones(carpeta),
+            "imagenes": [{k: m[k] for k in ("archivo", "titulo", "contexto", "origen")} for m in prototipo.imagenes_de(carpeta)],
             "proceso": prototipo.GESTOR.estado(id_), "captura": {"pantallas": prototipo.pantallas_capturadas(carpeta / "captura")}}
+
+
+@app.post("/api/prototipos/{id_}/imagenes")
+async def subir_imagenes(id_: str, archivos: list[UploadFile] = File(...)) -> dict[str, Any]:
+    """Word adicionales (otras especificaciones o actas con maquetas): suman sus imágenes sin repetir."""
+    carpeta = _carpeta_proto(id_)
+    entradas = carpeta / "_entradas"
+    entradas.mkdir(exist_ok=True)
+    for a in archivos:
+        destino = entradas / _nombre_seguro(a.filename or "documento.docx")
+        if destino.suffix.lower() != ".docx":
+            raise HTTPException(400, "Sólo se extraen imágenes de archivos Word (.docx).")
+        destino.write_bytes(await a.read())
+        prototipo.agregar_imagenes(carpeta, destino)
+    return {"imagenes": [{k: m[k] for k in ("archivo", "titulo", "contexto", "origen")} for m in prototipo.imagenes_de(carpeta)]}
+
+
+@app.get("/api/prototipos/{id_}/imagenes/{archivo}")
+def imagen_prototipo(id_: str, archivo: str) -> FileResponse:
+    from .imagenes import RE_ARCHIVO, tipo_de
+
+    carpeta = _carpeta_proto(id_)
+    if not RE_ARCHIVO.match(archivo) or archivo not in {m["archivo"] for m in prototipo.imagenes_de(carpeta)}:
+        raise HTTPException(404, "Imagen no encontrada.")
+    return FileResponse(carpeta / "imagenes" / archivo, media_type=tipo_de(archivo))
 
 
 class PeticionLevantar(BaseModel):
@@ -727,6 +759,8 @@ class PeticionLevantar(BaseModel):
 @app.post("/api/prototipos/{id_}/levantar")
 def levantar_prototipo(id_: str, p: PeticionLevantar) -> dict[str, Any]:
     meta = prototipo.leer_meta(_carpeta_proto(id_))
+    if meta.get("modo") == "documento":
+        raise HTTPException(400, "Este prototipo se arma sólo con el documento: no tiene un proyecto que levantar.")
     try:
         if p.url:
             return prototipo.GESTOR.adoptar_url(id_, p.url)
@@ -782,10 +816,12 @@ def archivo_captura(id_: str, nombre: str) -> FileResponse:
 
 @app.post("/api/prototipos/{id_}/mensaje")
 def mensaje_prototipo(id_: str, texto: str = Form(""), proveedor: str = Form("claude"), modelo: str = Form(""),
-                      esfuerzo: str = Form("")) -> dict[str, str]:
+                      esfuerzo: str = Form(""), imagenes: str = Form("")) -> dict[str, str]:
     carpeta = _carpeta_proto(id_)
     if not texto.strip():
         raise HTTPException(400, "Escriba qué cambio quiere ver en el prototipo.")
+    # Sin elección explícita, el modo documento usa todas las maquetas disponibles.
+    elegidas = [x.strip() for x in imagenes.split(",") if x.strip()] or None
     with _candado:
         if id_ in _proto_ocupados:
             raise HTTPException(409, "El prototipo ya está generando una versión; espere a que termine.")
@@ -798,7 +834,7 @@ def mensaje_prototipo(id_: str, texto: str = Form(""), proveedor: str = Form("cl
             uso = Uso()
             datos = almacen().obtener(rfd_id)["datos"] if rfd_id is not None else None
             r = prototipo.turno(carpeta, texto, proveedor=proveedor, modelo=_modelo_de(proveedor, modelo), directorio=carpeta, rfd=datos,
-                                esfuerzo=esfuerzo if proveedor == "codex" else "", uso=uso,
+                                esfuerzo=esfuerzo if proveedor == "codex" else "", uso=uso, imagenes=elegidas,
                                 progreso=lambda paso, detalle: _actualizar(trabajo_id, paso=paso, detalle=detalle))
             _actualizar(trabajo_id, estado="listo", paso="listo", fin=time.time(), uso=uso.como_dict(), resultado=r)
         except Exception as e:  # noqa: BLE001
@@ -835,11 +871,26 @@ def adjuntar_prototipo(id_: str, p: PeticionAdjuntar) -> dict[str, Any]:
     version = p.version if p.version is not None else disponibles[-1]
     if version not in disponibles:
         raise HTTPException(404, "Versión no encontrada.")
-    destino = _prototipo_html_rfd(almacen().obtener(rfd_id))
+    base = almacen().obtener(rfd_id)
+    destino = _prototipo_html_rfd(base)
     if destino is None:
         raise HTTPException(409, "El RFD no tiene un Word en disco junto al cual guardar el prototipo.")
     shutil.copyfile(carpeta / f"v{version}.html", destino)
-    return {"ok": True, "version": version, "archivo": destino.name}
+    # Cada pantalla pasa a la carpeta de UI del RFD: la próxima versión del Word la inserta en su ventana.
+    from .imagenes import agregar_imagen, directorio_ui
+
+    pantallas, aviso = 0, ""
+    try:
+        capturas = prototipo.capturar_pantallas_html(carpeta / f"v{version}.html")
+        ui = directorio_ui(destino.parent, base["codigo"])
+        for nombre, png in capturas:
+            agregar_imagen(ui, png, f"Prototipo › {nombre}", "", f"prototipo v{version}", reemplazar=True)
+        pantallas = len(capturas)
+        if not capturas:
+            aviso = "El prototipo no marca sus pantallas con data-pantalla: no se capturó ninguna para el Word."
+    except RuntimeError as e:
+        aviso = f"El HTML quedó adjunto, pero no se capturaron las pantallas: {e}"
+    return {"ok": True, "version": version, "archivo": destino.name, "pantallas": pantallas, "aviso": aviso}
 
 
 if ESTATICOS.is_dir():

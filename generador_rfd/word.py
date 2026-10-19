@@ -129,6 +129,67 @@ def tabla_de(muestra: etree._Element, filas: list[list[str]], encabezado: list[s
     return tabla
 
 
+REL_IMAGEN = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+EMU_POR_PX = 9525              # 96 ppp
+ANCHO_MAX_EMU = 6 * 914400     # 6 pulgadas: el ancho útil de la página de la plantilla
+
+
+def _dimensiones(datos: bytes) -> tuple[int, int]:
+    """Ancho y alto en píxeles de un PNG, GIF o JPEG (sin dependencias); 800×600 si no se reconoce."""
+    import struct
+
+    if datos[:8] == b"\x89PNG\r\n\x1a\n":
+        return struct.unpack(">II", datos[16:24])
+    if datos[:6] in (b"GIF87a", b"GIF89a"):
+        return struct.unpack("<HH", datos[6:10])
+    if datos[:2] == b"\xff\xd8":
+        i = 2
+        while i + 9 < len(datos):
+            if datos[i] != 0xFF:
+                i += 1
+                continue
+            marca, largo = datos[i + 1], struct.unpack(">H", datos[i + 2:i + 4])[0]
+            if marca in (0xC0, 0xC1, 0xC2):
+                alto, ancho = struct.unpack(">HH", datos[i + 5:i + 9])
+                return ancho, alto
+            i += 2 + largo
+    return 800, 600
+
+
+def figura(muestra: etree._Element, rid: str, numero: int, datos: bytes, nombre: str) -> etree._Element:
+    """Párrafo centrado con la imagen en línea, escalada al ancho de la página."""
+    ancho, alto = _dimensiones(datos)
+    cx = ancho * EMU_POR_PX
+    cy = alto * EMU_POR_PX
+    if cx > ANCHO_MAX_EMU:
+        cx, cy = ANCHO_MAX_EMU, int(cy * ANCHO_MAX_EMU / cx)
+    p = parrafo_de(muestra, "")
+    ppr = p.find("w:pPr", NS)
+    if ppr is None:
+        ppr = etree.Element(tag("pPr"))
+        p.insert(0, ppr)
+    for jc in ppr.findall("w:jc", NS):
+        ppr.remove(jc)
+    etree.SubElement(ppr, tag("jc")).set(tag("val"), "center")
+    for run in p.findall("w:r", NS):
+        p.remove(run)
+    dibujo = etree.fromstring(f"""<w:r xmlns:w="{W}"
+        xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+        xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+        xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"
+        xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:drawing>
+      <wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="{cx}" cy="{cy}"/>
+        <wp:docPr id="{9000 + numero}" name="Maqueta {numero}"/>
+        <wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>
+        <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic>
+          <pic:nvPicPr><pic:cNvPr id="{numero}" name="{nombre}"/><pic:cNvPicPr/></pic:nvPicPr>
+          <pic:blipFill><a:blip r:embed="{rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>
+          <pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>
+        </pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>""")
+    p.append(dibujo)
+    return p
+
+
 def _campo(tipo: str) -> etree._Element:
     run = etree.Element(tag("r"))
     etree.SubElement(run, tag("fldChar")).set(tag("fldCharType"), tipo)
@@ -236,7 +297,13 @@ def _numerar(p: etree._Element, num_id: str | None) -> etree._Element:
 
 
 def _cuerpo(parrafos: list[etree._Element], tablas: list[etree._Element], d: dict,
-            numeros: dict[int, str] | None = None) -> tuple[list[etree._Element], list[tuple[str, str]]]:
+            numeros: dict[int, str] | None = None, ui: Path | None = None,
+            medios: list[tuple[str, str, bytes]] | None = None) -> tuple[list[etree._Element], list[tuple[str, str]]]:
+    """`ui`: carpeta de maquetas y capturas del RFD; cada imagen insertada se anota en `medios` (rId, archivo, bytes)."""
+    from .imagenes import leer_indice
+
+    indice = leer_indice(ui) if ui else []
+    medios = medios if medios is not None else []
     bloques: list[etree._Element] = []
     toc: list[tuple[str, str]] = []
     capitulo, seccion, subseccion, texto_normal = parrafos[51], parrafos[52], parrafos[66], parrafos[53]
@@ -277,8 +344,22 @@ def _cuerpo(parrafos: list[etree._Element], tablas: list[etree._Element], d: dic
         else:
             p(nombre, negrita=True)
 
+    def imagen_de(r: dict, ventana: dict) -> None:
+        """La maqueta asignada a la ventana o, si no tiene, la captura del prototipo de esa misma ventana («RF-01 · Detalle»)."""
+        captura = f"prototipo › {r['id']} · {ventana['nombre']}".lower()
+        entrada = (next((x for x in indice if x["archivo"] == ventana.get("imagen")), None)
+                   or next((x for x in indice if x["titulo"].lower() == captura), None))
+        if entrada is None or ui is None or not (ui / entrada["archivo"]).is_file():
+            return
+        datos = (ui / entrada["archivo"]).read_bytes()
+        numero = len(medios) + 1
+        rid = f"rIdUi{numero}"
+        archivo = f"ui_{numero:02}{Path(entrada['archivo']).suffix.lower()}"
+        medios.append((rid, archivo, datos))
+        bloques.append(figura(texto_normal, rid, numero, datos, archivo))
+
     def especificacion(r: dict) -> None:
-        """Por portal: definiciones generales, cada ventana con sus secciones y campos, y reglas de negocio."""
+        """Por portal: definiciones generales, cada ventana con su imagen, secciones y campos, y reglas de negocio."""
         for v in r["vistas"]:
             sufijo = f" ({v['portal']})" if v["portal"].strip() else ""
             if v["definiciones_generales"]:
@@ -288,6 +369,7 @@ def _cuerpo(parrafos: list[etree._Element], tablas: list[etree._Element], d: dic
                 h3(f"Definiciones de la ventana {ventana['nombre']}{sufijo}")
                 if ventana["descripcion"].strip():
                     p(ventana["descripcion"])
+                imagen_de(r, ventana)
                 for s in ventana["secciones"]:
                     rotulo(s["nombre"], s["descripcion"])
                     if s["campos"]:
@@ -423,7 +505,30 @@ def _cuerpo(parrafos: list[etree._Element], tablas: list[etree._Element], d: dic
     return bloques, toc
 
 
-def crear_docx(datos: dict, plantilla: Path, salida: Path) -> None:
+def _con_medios(rels_xml: bytes, tipos_xml: bytes, medios: list[tuple[str, str, bytes]]) -> tuple[bytes, bytes]:
+    """Relaciones de las imágenes insertadas y el tipo de contenido de cada extensión."""
+    from .imagenes import tipo_de
+
+    rels = etree.fromstring(rels_xml)
+    for rid, archivo, _ in medios:
+        rel = etree.SubElement(rels, f"{{{rels.nsmap[None]}}}Relationship")
+        rel.set("Id", rid)
+        rel.set("Type", REL_IMAGEN)
+        rel.set("Target", f"media/{archivo}")
+    tipos = etree.fromstring(tipos_xml)
+    ns = tipos.nsmap[None]
+    existentes = {d.get("Extension", "").lower() for d in tipos.findall(f"{{{ns}}}Default")}
+    for extension in sorted({Path(a).suffix.lower().lstrip(".") for _, a, _ in medios} - existentes):
+        default = etree.Element(f"{{{ns}}}Default")
+        default.set("Extension", extension)
+        default.set("ContentType", tipo_de(f"x.{extension}"))
+        tipos.insert(0, default)
+    return (etree.tostring(rels, xml_declaration=True, encoding="UTF-8", standalone="yes"),
+            etree.tostring(tipos, xml_declaration=True, encoding="UTF-8", standalone="yes"))
+
+
+def crear_docx(datos: dict, plantilla: Path, salida: Path, ui: Path | None = None) -> None:
+    """`ui`: carpeta con las maquetas y capturas del RFD; las ventanas que tengan imagen la llevan en el Word."""
     validar_estructura(datos)
     if not plantilla.is_file():
         raise FileNotFoundError(f"No se encontró la plantilla: {plantilla}")
@@ -441,7 +546,8 @@ def crear_docx(datos: dict, plantilla: Path, salida: Path) -> None:
         indice = next((e for e in list(cuerpo)[:inicio] if e.tag == tag("sdt") and "Contenido" in texto(e)), None)
         seccion_final = deepcopy(list(cuerpo)[-1])
         numbering = etree.fromstring(origen.read("word/numbering.xml"))
-        bloques, toc = _cuerpo(parrafos, tablas, datos, numeracion_por_capitulo(numbering))
+        medios: list[tuple[str, str, bytes]] = []
+        bloques, toc = _cuerpo(parrafos, tablas, datos, numeracion_por_capitulo(numbering), ui, medios)
         numbering_xml = etree.tostring(numbering, xml_declaration=True, encoding="UTF-8", standalone="yes")
         _portada(cuerpo, parrafos, tablas, datos)
         if indice is not None:
@@ -483,9 +589,14 @@ def crear_docx(datos: dict, plantilla: Path, salida: Path) -> None:
         core_xml = etree.tostring(core, xml_declaration=True, encoding="UTF-8", standalone="yes")
         reemplazos = {"word/document.xml": documento_xml, "word/footer2.xml": pie_xml, "docProps/core.xml": core_xml,
                       "word/numbering.xml": numbering_xml}
+        if medios:
+            reemplazos["word/_rels/document.xml.rels"], reemplazos["[Content_Types].xml"] = _con_medios(
+                origen.read("word/_rels/document.xml.rels"), origen.read("[Content_Types].xml"), medios)
         with ZipFile(salida, "w") as destino:
             for item in origen.infolist():
                 destino.writestr(item, reemplazos.get(item.filename, origen.read(item.filename)))
+            for _, archivo, contenido in medios:
+                destino.writestr(f"word/media/{archivo}", contenido)
 
 
 def texto_docx(ruta: Path) -> str:

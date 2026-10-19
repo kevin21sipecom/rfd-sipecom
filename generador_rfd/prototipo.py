@@ -347,6 +347,62 @@ def _sync_playwright() -> Any:
     return sync_playwright
 
 
+def _navegador(p: Any) -> Any:
+    """Chrome o, si no está, Edge: los navegadores ya instalados (Playwright no descarga ninguno)."""
+    fallos = []
+    for canal in ("chrome", "msedge"):
+        try:
+            return p.chromium.launch(channel=canal)
+        except Exception as e:  # noqa: BLE001 - el canal no está instalado: se prueba el siguiente
+            fallos.append(f"{canal}: {e}")
+    raise RuntimeError("No se encontró Chrome o Edge para abrir el proyecto (no se descarga ningún navegador). " + " | ".join(fallos)[:300])
+
+
+# Muestra sólo la pantalla pedida (y las pantallas que la contienen); el resto queda oculto.
+JS_MOSTRAR = r"""(indice) => {
+  const todas = [...document.querySelectorAll('[data-pantalla]')];
+  const objetivo = todas[indice];
+  for (const e of todas) {
+    e.style.removeProperty('display');
+    if (e !== objetivo && !e.contains(objetivo)) e.style.setProperty('display', 'none', 'important');
+  }
+  // Una ventana emergente suele vivir dentro de un contenedor oculto sin marca: se muestra toda la cadena.
+  for (let e = objetivo; e && e !== document.documentElement; e = e.parentElement) {
+    const estilo = getComputedStyle(e);
+    if (estilo.display === 'none') e.style.setProperty('display', 'block', 'important');
+    if (estilo.visibility === 'hidden') e.style.setProperty('visibility', 'visible', 'important');
+    if (estilo.opacity === '0') e.style.setProperty('opacity', '1', 'important');
+    if (estilo.transform !== 'none') e.style.setProperty('transform', 'none', 'important');
+  }
+}"""
+
+
+def capturar_pantallas_html(html: Path) -> list[tuple[str, bytes]]:
+    """PNG de cada elemento data-pantalla del prototipo («RF-01 · principal»…), para insertarlo en el Word del RFD."""
+    sync_playwright = _sync_playwright()
+    capturas: list[tuple[str, bytes]] = []
+    with sync_playwright() as p:
+        navegador = _navegador(p)
+        try:
+            pagina = navegador.new_page(viewport={"width": 1366, "height": 850})
+            pagina.set_content(html.read_text(encoding="utf-8"), wait_until="load")
+            nombres = pagina.evaluate("() => [...document.querySelectorAll('[data-pantalla]')].map(e => e.dataset.pantalla.trim())")
+            vistos: set[str] = set()
+            for i, nombre in enumerate(nombres):
+                if not nombre or nombre in vistos:
+                    continue
+                vistos.add(nombre)
+                pagina.evaluate(JS_MOSTRAR, i)
+                pagina.wait_for_timeout(150)
+                try:
+                    capturas.append((nombre, pagina.query_selector_all("[data-pantalla]")[i].screenshot(timeout=5_000)))
+                except Exception:  # noqa: BLE001 - una pantalla que no se deja mostrar no impide capturar las demás
+                    continue
+        finally:
+            navegador.close()
+    return capturas
+
+
 def capturar(url: str, rutas: list[str], destino: Path) -> list[dict[str, str]]:
     """Abre el proyecto en Chrome o Edge (sin descargar navegadores) y guarda por ruta: captura PNG, DOM, CSS y resumen del diseño."""
     base = _normalizar_url(url)
@@ -357,15 +413,7 @@ def capturar(url: str, rutas: list[str], destino: Path) -> list[dict[str, str]]:
     hojas: list[str] = []
     diseno: dict[str, Any] = {}
     with sync_playwright() as p:
-        navegador, fallos = None, []
-        for canal in ("chrome", "msedge"):
-            try:
-                navegador = p.chromium.launch(channel=canal)
-                break
-            except Exception as e:  # noqa: BLE001 - el canal no está instalado: se prueba el siguiente
-                fallos.append(f"{canal}: {e}")
-        if navegador is None:
-            raise RuntimeError("No se encontró Chrome o Edge para abrir el proyecto (no se descarga ningún navegador). " + " | ".join(fallos)[:300])
+        navegador = _navegador(p)
         try:
             pagina = navegador.new_page(viewport={"width": 1366, "height": 850})
             for i, ruta in enumerate(limpias, 1):
@@ -441,22 +489,47 @@ El prototipo debe verse como el sistema original, porque es el mismo sistema con
 - Si ya existe un prototipo, modifícalo según el mensaje y conserva todo lo que el mensaje no pide cambiar."""
 
 
-def _texto_rfd(datos: dict[str, Any], tope: int = 12_000) -> str:
+REGLAS_DOCUMENTO = """Eres un diseñador de producto que construye el prototipo navegable de las pantallas que describe un RFD, a partir de las maquetas de UI de ese documento.
+Reglas:
+- Entrega UN SOLO archivo HTML autocontenido (CSS en <style>, JavaScript mínimo en <script>), sin CDN y sin peticiones externas: nada de <script src>, <link href> ni imágenes remotas.
+- Las imágenes adjuntas son las maquetas, en el orden de la lista «MAQUETAS DEL DOCUMENTO». Reprodúcelas con fidelidad: misma disposición (menú lateral, encabezado, migas de pan, título, tarjetas de indicadores, panel de filtros, matriz de resultados, paginación, ventanas emergentes), mismos colores, textos, columnas, botones e íconos aproximados con CSS o SVG en línea.
+- Las pantallas del RFD que no tienen maqueta se diseñan con el mismo lenguaje visual de las maquetas (mismo menú, mismos componentes) y con las ventanas, secciones y campos del RFD.
+- Usa datos de ejemplo verosímiles y coherentes con el RFD y con el formato de las maquetas (números de documento, fechas y montos).
+- Simula la navegación con JavaScript mínimo en línea: el menú cambia de pantalla, «Detalle» abre su ventana emergente, los filtros se colapsan. No hagas llamadas reales a un servidor.
+- Envuelve cada pantalla o ventana en un elemento con data-pantalla="<id del requerimiento> · <nombre de la ventana>" (p. ej. «RF-01 · principal», «RF-01 · Detalle») para poder capturarla por separado.
+- Todo el texto va en español.
+- «resumen»: 2 a 4 frases en español, dirigidas al usuario, con lo que se construyó o cambió y lo que quedó pendiente.
+- Si ya existe un prototipo, modifícalo según el mensaje y conserva todo lo que el mensaje no pide cambiar."""
+
+
+def _texto_rfd(datos: dict[str, Any], tope: int = 20_000) -> str:
     lineas = [f"Título: {datos.get('titulo', '')}", f"Objetivo: {datos.get('objetivo', '')}"]
     for r in datos.get("requerimientos", []):
         lineas.append(f"\n{r.get('id', '')} {r.get('nombre', '')}")
         lineas += [f"  {p}" for p in r.get("parrafos", [])[:3]]
         lineas += [f"  Elemento: {e.get('titulo', '')}: {e.get('detalle', '')}" for e in r.get("elementos", [])]
+        for v in r.get("vistas", []):
+            for ventana in v.get("ventanas", []):
+                lineas.append(f"  Ventana {ventana.get('nombre', '')} ({v.get('portal', '')}): {ventana.get('descripcion', '')}")
+                for s in ventana.get("secciones", []):
+                    campos = ", ".join(f"{c.get('nombre', '')} [{c.get('tipo', '')}]" for c in s.get("campos", []))
+                    lineas.append(f"    {s.get('nombre', '')}: {campos}")
         lineas += [f"  Paso {f.get('numero', '')}: {f.get('actor', '')} · {f.get('componente', '')} · {f.get('accion', '')}" for f in r.get("flujo", [])]
         lineas += [f"  Criterio: {c}" for c in r.get("criterios_aceptacion", [])]
     return "\n".join(lineas)[:tope]
 
 
-def prompt_prototipo(*, mensaje: str, diseno: str, html_actual: str, rfd: dict[str, Any] | None, chat: list[dict[str, Any]]) -> str:
-    partes = [REGLAS_PROTOTIPO, INTEGRIDAD]
+def prompt_prototipo(*, mensaje: str, diseno: str, html_actual: str, rfd: dict[str, Any] | None, chat: list[dict[str, Any]],
+                     maquetas: list[dict[str, Any]] | None = None, modo: str = "proyecto") -> str:
+    partes = [REGLAS_DOCUMENTO if modo == "documento" else REGLAS_PROTOTIPO, INTEGRIDAD]
     if rfd:
-        partes.append("# RFD que describe el cambio (requerimientos y flujos)\n" + _texto_rfd(rfd))
-    partes.append("# Diseño del proyecto ORIGINAL (úsalo tal cual)\n" + (diseno or "No hay diseño disponible: usa una apariencia neutra y dilo en «resumen»."))
+        partes.append("# RFD que describe el cambio (requerimientos, ventanas, campos y flujos)\n" + _texto_rfd(rfd))
+    if maquetas:
+        partes.append("# MAQUETAS DEL DOCUMENTO (imágenes adjuntas, en este orden)\n" + "\n".join(
+            f"{i}. {m['archivo']} — {m.get('titulo') or 'sin título'}" + (f": «{m['contexto']}»" if m.get("contexto") else "")
+            for i, m in enumerate(maquetas, 1)))
+    if modo != "documento":
+        partes.append("# Diseño del proyecto ORIGINAL (úsalo tal cual)\n" + (diseno or "No hay diseño disponible: usa una apariencia neutra y dilo en «resumen»."))
     if html_actual:
         partes.append("# Prototipo actual (última versión)\n" + html_actual[:MAX_HTML_ACTUAL])
     if chat:
@@ -470,14 +543,47 @@ def _ahora() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def crear_prototipo(raiz: Path, ruta_proyecto: str | Path, rfd_id: int | None = None) -> str:
-    proyecto = validar_proyecto(ruta_proyecto)
+MODOS = ("proyecto", "documento")
+MAX_MAQUETAS = 12
+
+
+def crear_prototipo(raiz: Path, ruta_proyecto: str | Path | None, rfd_id: int | None = None, modo: str = "proyecto") -> str:
+    """«proyecto»: el cambio sobre el sistema original (se levanta y se captura). «documento»: sólo las maquetas del RFD."""
+    if modo not in MODOS:
+        raise ValueError("El modo del prototipo debe ser «proyecto» o «documento».")
+    ruta = str(validar_proyecto(ruta_proyecto)) if modo == "proyecto" else ""
     id_ = uuid.uuid4().hex[:10]
     carpeta = raiz / id_
     carpeta.mkdir(parents=True)
     (carpeta / "meta.json").write_text(json.dumps(
-        {"id": id_, "ruta": str(proyecto), "rfd_id": rfd_id, "creado": _ahora()}, ensure_ascii=False, indent=2), encoding="utf-8")
+        {"id": id_, "modo": modo, "ruta": ruta, "rfd_id": rfd_id, "creado": _ahora()}, ensure_ascii=False, indent=2), encoding="utf-8")
     return id_
+
+
+def agregar_imagenes(carpeta: Path, docx: Path) -> list[dict[str, Any]]:
+    """Suma al prototipo las maquetas de un Word (sin repetir) y devuelve todas las disponibles."""
+    from .imagenes import extraer_imagenes
+
+    return extraer_imagenes(docx, carpeta / "imagenes")
+
+
+def imagenes_de(carpeta: Path) -> list[dict[str, Any]]:
+    from .imagenes import leer_indice
+
+    return leer_indice(carpeta / "imagenes")
+
+
+def _maquetas(carpeta: Path, elegidas: list[str] | None, modo: str) -> list[dict[str, Any]]:
+    """Las maquetas elegidas, validadas contra el índice; sin elección, todas en el modo documento."""
+    disponibles = {m["archivo"]: m for m in imagenes_de(carpeta)}
+    if elegidas is None:
+        return list(disponibles.values())[:MAX_MAQUETAS] if modo == "documento" else []
+    for nombre in elegidas:
+        if nombre not in disponibles:
+            raise ValueError(f"La imagen «{nombre}» no existe en el prototipo.")
+    if len(elegidas) > MAX_MAQUETAS:
+        raise ValueError(f"Elija hasta {MAX_MAQUETAS} imágenes por mensaje.")
+    return [disponibles[n] for n in dict.fromkeys(elegidas)]
 
 
 def carpeta_de(raiz: Path, id_: str) -> Path:
@@ -520,22 +626,28 @@ def recursos_externos(html: str) -> list[str]:
 
 
 def turno(carpeta: Path, mensaje: str, *, proveedor: str, modelo: str, directorio: Path, rfd: dict[str, Any] | None = None,
-          esfuerzo: str = "", uso: Any = None, progreso: Any = None) -> dict[str, Any]:
-    """Un turno del chat: arma el prompt (RFD + diseño original + versión actual + mensaje), pide el HTML al modelo y guarda la versión."""
+          esfuerzo: str = "", uso: Any = None, progreso: Any = None, imagenes: list[str] | None = None) -> dict[str, Any]:
+    """Un turno del chat: arma el prompt (RFD + diseño original o maquetas + versión actual + mensaje), pide el HTML y guarda la versión.
+
+    `imagenes`: nombres de las maquetas elegidas (img_01.png…); el modelo las recibe como imágenes, no como texto.
+    """
     mensaje = mensaje.strip()
     if not mensaje:
         raise ValueError("Escriba qué cambio quiere ver en el prototipo.")
     avisar = progreso or (lambda paso, detalle: None)
     meta = leer_meta(carpeta)
-    avisar("fuentes", "Reuniendo el diseño del proyecto original")
-    diseno = contexto_captura(carpeta / "captura") or diseno_estatico(meta["ruta"])
+    modo = meta.get("modo", "proyecto")
+    maquetas = _maquetas(carpeta, imagenes, modo)
+    avisar("fuentes", "Reuniendo las maquetas del documento" if modo == "documento" else "Reuniendo el diseño del proyecto original")
+    diseno = "" if modo == "documento" else contexto_captura(carpeta / "captura") or diseno_estatico(meta["ruta"])
     previas = versiones(carpeta)
     actual = (carpeta / f"v{previas[-1]}.html").read_text(encoding="utf-8") if previas else ""
     chat = leer_chat(carpeta)
-    avisar("modelo", "Construyendo el prototipo sobre el diseño original")
+    avisar("modelo", f"Construyendo el prototipo con {len(maquetas)} maqueta(s)" if maquetas else "Construyendo el prototipo sobre el diseño original")
     respuesta = invocar(
         proveedor=proveedor, modelo=modelo, esquema=ESQUEMA_PROTOTIPO, directorio=directorio, uso=uso, esfuerzo=esfuerzo,
-        prompt=prompt_prototipo(mensaje=mensaje, diseno=diseno, html_actual=actual, rfd=rfd, chat=chat),
+        prompt=prompt_prototipo(mensaje=mensaje, diseno=diseno, html_actual=actual, rfd=rfd, chat=chat, maquetas=maquetas, modo=modo),
+        **({"imagenes": [carpeta / "imagenes" / m["archivo"] for m in maquetas]} if maquetas else {}),
     )
     html = respuesta.get("html", "") if isinstance(respuesta, dict) else ""
     if not isinstance(html, str) or not re.search(r"<!doctype|<html", html, re.I):

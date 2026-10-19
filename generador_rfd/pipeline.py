@@ -23,6 +23,7 @@ from zipfile import BadZipFile
 from lxml import etree
 
 from .fuentes import Fuente, cargar_fuentes, leer_documento, limite_para
+from .imagenes import directorio_ui, extraer_imagenes, leer_indice
 from .calidad import UMBRAL, Evaluacion, evaluar, instrucciones_correccion
 from .reglas import Regla, bloque_prompt, incumplidas
 from .modelo import (Uso, adaptar_rfd, analizar_fuentes, continuar_rfd, corregir_rfd, detallar_requerimiento, reconstruir_rfd,
@@ -170,7 +171,8 @@ def publicar(datos: dict, salida: Path, plantilla: Path = PLANTILLA, publico: bo
         raise ValueError(f"El modo público exige resolver {len(hallazgos)} hallazgo(s). Revise {informe}.")
     if progreso:
         progreso("word", "Armando el Word con la plantilla SIPECOM")
-    crear_docx(datos, plantilla.expanduser().resolve(), salida)
+    ui = directorio_ui(salida.parent, datos["codigo"])
+    crear_docx(datos, plantilla.expanduser().resolve(), salida, ui if ui.is_dir() else None)
     salida.with_suffix(".json").write_text(json.dumps(datos, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     from .cuestionario import crear_cuestionario
 
@@ -235,7 +237,8 @@ def generar(o: Opciones, progreso: Progreso | None = None) -> Resultado:
     # El texto del autor se entrega al corrector para que la revisión editorial no lo reescriba.
     autor = "\n\n".join(f.para_prompt() for f in fuentes if f.categoria == "avance")
     datos, calidad = asegurar_calidad(datos, o, analisis, uso, directorio, avisar, preservar=autor)
-    detalle = detallar(datos, [f for f in fuentes if f.categoria != "estilo"], analisis, o, uso, directorio, avisar, registrar=False)
+    ui = reunir_maquetas([*o.avances, *o.contextos, *o.transcripciones], directorio_ui(o.salida.expanduser().resolve().parent, o.codigo))
+    detalle = detallar(datos, [f for f in fuentes if f.categoria != "estilo"], analisis, o, uso, directorio, avisar, registrar=False, ui=ui)
     return publicar(datos, o.salida, o.plantilla, o.publico, revisar_word=o.revisar_word,
                     terminos=terminos_ajenos(fuentes, o.cliente), uso=uso.como_dict(), fuentes=fuentes, progreso=avisar,
                     calidad=calidad, extra_hallazgos=hallazgos_reglas(datos, o.reglas) + (hallazgos_calidad_autor(calidad) if autor else []) + detalle)
@@ -249,27 +252,46 @@ def _palabras(textos: Any) -> int:
     return sum(_palabras(v) for v in textos) if isinstance(textos, list) else 0
 
 
+MAX_MAQUETAS_DETALLE = 12
+
+
+def reunir_maquetas(documentos: list[Path], ui: Path) -> Path:
+    """Suma a la carpeta de UI del RFD las maquetas de los Word de entrada (las repetidas no se duplican)."""
+    for doc in documentos:
+        if doc.suffix.lower() == ".docx" and doc.is_file():
+            extraer_imagenes(doc, ui)
+    return ui
+
+
 def detallar(datos: dict, fuentes: list[Fuente], analisis: dict[str, dict[str, Any]] | None, o: Any, uso: Uso, directorio: Path,
-             avisar: Progreso, registrar: bool = True, instruccion: str = "") -> list[Hallazgo]:
+             avisar: Progreso, registrar: bool = True, instruccion: str = "", ui: Path | None = None) -> list[Hallazgo]:
     """Redacta la especificación por pantalla de cada opción, una llamada por requerimiento.
 
     En una sola redacción el modelo comprime todas las opciones al mismo molde breve; por separado, cada una
     recibe las fuentes completas y la sección más detallada del autor como modelo. Una sección general que
-    resumía la opción se quita sólo si la especificación nueva es más extensa que ella.
+    resumía la opción se quita sólo si la especificación nueva es más extensa que ella. Las maquetas de `ui`
+    viajan como imágenes: el modelo lee de ellas columnas y campos, y asigna a cada ventana la que la muestra.
     """
     hallazgos: list[Hallazgo] = []
+    maquetas = leer_indice(ui)[:MAX_MAQUETAS_DETALLE] if ui else []
+    extra = {"maquetas": maquetas, "imagenes": [ui / m["archivo"] for m in maquetas]} if maquetas and ui else {}
     pendientes = [r for r in datos["requerimientos"] if not r["vistas"] and not r["elementos"]]
     for i, r in enumerate(pendientes, 1):
         avisar("detalle", f"Especificando pantallas y reglas ({i}/{len(pendientes)}): {r['nombre'] or r['id']}")
         try:
             detalle = detallar_requerimiento(datos=datos, requerimiento=r, fuentes=fuentes, analisis=analisis, proveedor=o.proveedor,
                                              modelo=o.modelo, directorio_salida=directorio, uso=uso, esfuerzo=o.esfuerzo,
-                                             reglas=bloque_prompt(getattr(o, "reglas", [])), instruccion=instruccion)
+                                             reglas=bloque_prompt(getattr(o, "reglas", [])), instruccion=instruccion, **extra)
         except (RuntimeError, ValueError) as e:
             hallazgos.append(Hallazgo("detalle_no_generado", f"{r['id']}: no se pudo redactar la especificación detallada ({str(e)[:160]})."))
             continue
         if not detalle["vistas"]:
             continue
+        validas = {m["archivo"] for m in maquetas}
+        for v in detalle["vistas"]:
+            for ventana in v["ventanas"]:
+                if ventana["imagen"] not in validas:   # sólo maquetas reales: el modelo no inventa archivos
+                    ventana["imagen"] = ""
         r["vistas"], r["integraciones"] = detalle["vistas"], detalle["integraciones"]
         extension = _palabras(detalle["vistas"]) + _palabras(detalle["integraciones"])
         reemplazar = set(detalle["secciones_reemplazadas"])
@@ -444,7 +466,9 @@ def _publicar_version(o: OpcionesMejora, nuevo: dict[str, Any], version: str, re
     con_codigo = any(c["ubicacion"].strip() for c in nuevo["componentes"]["items"])
     nuevo, calidad = asegurar_calidad(nuevo, o, analisis, uso, o.salida_dir, avisar, con_codigo, preservar=preservar)
     if detalle:
-        extra += detallar(nuevo, adjuntos, analisis, o, uso, o.salida_dir, avisar, instruccion=o.instruccion)
+        # Maquetas del Word del autor (el base, si es un .docx) y de los documentos de contexto.
+        ui = reunir_maquetas([o.base, *o.adjuntos], directorio_ui(o.salida_dir, nuevo["codigo"]))
+        extra += detallar(nuevo, adjuntos, analisis, o, uso, o.salida_dir, avisar, instruccion=o.instruccion, ui=ui)
     extra += hallazgos_reglas(nuevo, o.reglas)
     if preservar:
         extra += hallazgos_calidad_autor(calidad)

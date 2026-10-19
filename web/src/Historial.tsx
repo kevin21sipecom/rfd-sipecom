@@ -3,6 +3,7 @@ import { api, type PreguntaGuardada, type RfdDetalle, type RfdResumen, type Trab
 import { Campo, Icono, Segmentado, ZonaArchivos } from "./components";
 import type { Motor } from "./Motor";
 import { PASOS_CONTINUAR, PASOS_IMPORTAR, PASOS_MEJORA, Progreso, ResultadoVista } from "./Panel";
+import { PanelPrototipo } from "./Prototipo";
 
 const EXTENSIONES = [".txt", ".md", ".docx", ".pptx", ".pdf", ".xlsx"];
 
@@ -60,7 +61,7 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
   const [seleccion, setSeleccion] = useState<number | null>(seleccionInicial);
   const [detalle, setDetalle] = useState<RfdDetalle | null>(null);
   const [adjuntos, setAdjuntos] = useState<File[]>([]);
-  const [modo, setModo] = useState<"mejorar" | "continuar">("mejorar");
+  const [modo, setModo] = useState<"mejorar" | "continuar" | "prototipo">("mejorar");
   const [contexto, setContexto] = useState<File[]>([]);
   const [instruccion, setInstruccion] = useState("");
   const [importando, setImportando] = useState(false);
@@ -89,7 +90,8 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
     setAviso("");
     api.rfd(seleccion).then((d) => {
       setDetalle(d);
-      setModo(d.origen === "en_avance" || d.origen === "continuado" ? "continuar" : "mejorar");
+      // Quien está prototipando sigue en esa pestaña al cambiar de RFD.
+      setModo((m) => (m === "prototipo" ? m : d.origen === "en_avance" || d.origen === "continuado" ? "continuar" : "mejorar"));
     }).catch((e: Error) => setError(e.message));
   }, [seleccion]);
   useEffect(() => {
@@ -229,6 +231,7 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
                 {detalle.archivos.docx && <a className="boton" href={api.archivoRfd(detalle.id, "docx")}><Icono n="download" size={15} /> Word</a>}
                 {detalle.archivos.pdf && <button type="button" className="boton" onClick={() => api.abrirRfd(detalle.id, "pdf")}><Icono n="doc" size={15} /> PDF</button>}
                 {detalle.archivos.cuestionario && <a className="boton" href={api.archivoRfd(detalle.id, "cuestionario")}><Icono n="download" size={15} /> Cuestionario</a>}
+                {detalle.archivos.prototipo && <a className="boton" href={api.archivoRfd(detalle.id, "prototipo")} target="_blank" rel="noreferrer"><Icono n="eye" size={15} /> Prototipo</a>}
                 <button type="button" className="boton fantasma" onClick={() => api.abrirRfd(detalle.id, "carpeta")}><Icono n="folder" size={15} /></button>
               </div>
               {detalle.cambios.length > 0 && (
@@ -309,8 +312,11 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
               <Segmentado valor={modo} onCambio={setModo} opciones={[
                 { valor: "continuar", etiqueta: "Continuar", detalle: "completar" },
                 { valor: "mejorar", etiqueta: "Mejorar", detalle: "con respuestas" },
+                { valor: "prototipo", etiqueta: "Prototipo", detalle: "UI" },
               ]} />
-              {modo === "continuar" ? (
+              {modo === "prototipo" ? (
+                detalle ? <PanelPrototipo rfd={detalle} motor={motor} /> : <p className="vacio">Seleccione un RFD.</p>
+              ) : modo === "continuar" ? (
                 <>
                   <h2 className="panel-titulo"><Icono n="play" size={16} /> Continuar RFD</h2>
                   <p className="campo-ayuda">

@@ -6,6 +6,7 @@ de los análisis, las fuentes completas, el sistema existente y las referencias 
 
 from __future__ import annotations
 
+import base64
 import json
 import shutil
 import subprocess
@@ -77,9 +78,11 @@ def _sin_meta(esquema: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in esquema.items() if k != "$schema"}
 
 
-def comando_claude(ejecutable: str, modelo: str, esquema: dict[str, Any]) -> list[str]:
+def comando_claude(ejecutable: str, modelo: str, esquema: dict[str, Any], con_imagenes: bool = False) -> list[str]:
+    # Con imágenes el mensaje va como JSON (bloques de imagen + texto): exige entrada y salida stream-json.
+    formato = ["--input-format", "stream-json", "--output-format", "stream-json", "--verbose"] if con_imagenes else ["--output-format", "json"]
     return [
-        ejecutable, "-p", "--output-format", "json",
+        ejecutable, "-p", *formato,
         "--json-schema", json.dumps(_sin_meta(esquema), ensure_ascii=False),
         "--model", modelo.strip() or MODELO_CLAUDE_DEFECTO,
         # Aislado: sin herramientas, MCP, plugins ni configuración del usuario; sesión efímera.
@@ -90,7 +93,7 @@ def comando_claude(ejecutable: str, modelo: str, esquema: dict[str, Any]) -> lis
 
 
 def comando_codex(ejecutable: str, proveedor: str, modelo: str, esfuerzo: str, trabajo: Path,
-                  esquema: Path, respuesta: Path) -> list[str]:
+                  esquema: Path, respuesta: Path, imagenes: list[Path] | tuple[Path, ...] = ()) -> list[str]:
     """Codex CLI aislado: sólo lectura, sin config.toml ni reglas del usuario, sesión efímera y eventos JSON."""
     comando = [ejecutable, "exec"]
     if proveedor in ("ollama", "lmstudio"):
@@ -99,6 +102,8 @@ def comando_codex(ejecutable: str, proveedor: str, modelo: str, esfuerzo: str, t
         comando += ["--model", modelo.strip()]
     if esfuerzo.strip() and proveedor == "codex":
         comando += ["-c", f'model_reasoning_effort="{esfuerzo.strip()}"']
+    for imagen in imagenes:
+        comando += ["--image", str(imagen)]
     return comando + [
         "--sandbox", "read-only", "--ephemeral", "--ignore-user-config", "--ignore-rules",
         "--skip-git-repo-check", "-C", str(trabajo), "--output-schema", str(esquema),
@@ -106,22 +111,50 @@ def comando_codex(ejecutable: str, proveedor: str, modelo: str, esfuerzo: str, t
     ]
 
 
-def _invocar_claude(prompt: str, esquema: dict[str, Any], modelo: str, directorio: Path, tiempo: int, uso: Uso | None) -> Any:
+def mensaje_con_imagenes(prompt: str, imagenes: list[Path]) -> str:
+    """Mensaje stream-json de Claude CLI: cada imagen en base64, en orden, y el texto al final."""
+    from .imagenes import tipo_de
+
+    bloques: list[dict[str, Any]] = [
+        {"type": "image", "source": {"type": "base64", "media_type": tipo_de(p), "data": base64.b64encode(Path(p).read_bytes()).decode()}}
+        for p in imagenes
+    ]
+    bloques.append({"type": "text", "text": prompt})
+    return json.dumps({"type": "user", "message": {"role": "user", "content": bloques}}, ensure_ascii=False) + "\n"
+
+
+def _resultado_claude(salida: str, stream: bool) -> dict[str, Any]:
+    if not stream:
+        return json.loads(salida[salida.find("{"):])
+    for linea in reversed(salida.splitlines()):
+        try:
+            evento = json.loads(linea)
+        except ValueError:
+            continue
+        if isinstance(evento, dict) and evento.get("type") == "result":
+            return evento
+    raise ValueError("sin evento result")
+
+
+def _invocar_claude(prompt: str, esquema: dict[str, Any], modelo: str, directorio: Path, tiempo: int, uso: Uso | None,
+                    imagenes: list[Path] | None = None) -> Any:
     ejecutable = shutil.which("claude")
     if not ejecutable:
         raise RuntimeError("No se encontró Claude Code CLI (claude) en PATH.")
     directorio.mkdir(parents=True, exist_ok=True)
+    stream = bool(imagenes)
+    entrada = mensaje_con_imagenes(prompt, imagenes) if stream else prompt
     with tempfile.TemporaryDirectory(prefix="rfd-claude-", dir=directorio) as temporal:
         try:
             proceso = subprocess.run(
-                comando_claude(ejecutable, modelo, esquema), input=prompt, text=True, encoding="utf-8",
+                comando_claude(ejecutable, modelo, esquema, stream), input=entrada, text=True, encoding="utf-8",
                 errors="replace", capture_output=True, timeout=tiempo, check=False, cwd=temporal,
             )
         except subprocess.TimeoutExpired as e:
             raise RuntimeError(f"Claude CLI superó el límite de {tiempo} segundos.") from e
     salida = (proceso.stdout or "").strip()
     try:
-        respuesta = json.loads(salida[salida.find("{"):])
+        respuesta = _resultado_claude(salida, stream)
     except (json.JSONDecodeError, ValueError):
         detalle = (proceso.stderr or salida).strip()[-1200:]
         raise RuntimeError(f"Claude CLI falló (código {proceso.returncode}). {detalle}")
@@ -165,7 +198,7 @@ def eventos_codex(salida: str) -> tuple[dict[str, int], str]:
 
 
 def _invocar_codex(prompt: str, esquema: dict[str, Any], proveedor: str, modelo: str, esfuerzo: str,
-                   directorio: Path, tiempo: int, uso: Uso | None) -> Any:
+                   directorio: Path, tiempo: int, uso: Uso | None, imagenes: list[Path] | None = None) -> Any:
     ejecutable = shutil.which("codex")
     if not ejecutable:
         raise RuntimeError("No se encontró Codex CLI en PATH.")
@@ -176,7 +209,7 @@ def _invocar_codex(prompt: str, esquema: dict[str, Any], proveedor: str, modelo:
         trabajo = Path(temporal)
         schema_path, salida_path = trabajo / "esquema.json", trabajo / "respuesta.json"
         schema_path.write_text(json.dumps(_sin_meta(esquema), ensure_ascii=False, indent=2), encoding="utf-8")
-        comando = comando_codex(ejecutable, proveedor, modelo, esfuerzo, trabajo, schema_path, salida_path)
+        comando = comando_codex(ejecutable, proveedor, modelo, esfuerzo, trabajo, schema_path, salida_path, imagenes or ())
         try:
             proceso = subprocess.run(comando, input=prompt, text=True, encoding="utf-8", errors="replace",
                                      capture_output=True, timeout=tiempo, check=False)
@@ -203,12 +236,13 @@ PROVEEDORES = ("claude", "codex", "ollama", "lmstudio")
 
 
 def invocar(*, proveedor: str, modelo: str, prompt: str, esquema: dict[str, Any], directorio: Path,
-            tiempo: int = 900, uso: Uso | None = None, esfuerzo: str = "") -> Any:
+            tiempo: int = 900, uso: Uso | None = None, esfuerzo: str = "", imagenes: list[Path] | None = None) -> Any:
+    """`imagenes`: archivos que el modelo debe ver (maquetas, capturas); se envían en orden antes del texto."""
     if proveedor == "claude":
-        return _invocar_claude(prompt, esquema, modelo, directorio, tiempo, uso)
+        return _invocar_claude(prompt, esquema, modelo, directorio, tiempo, uso, imagenes)
     if proveedor not in PROVEEDORES:
         raise ValueError("Proveedor no admitido; use " + ", ".join(PROVEEDORES) + ".")
-    return _invocar_codex(prompt, esquema, proveedor, modelo, esfuerzo, directorio, tiempo, uso)
+    return _invocar_codex(prompt, esquema, proveedor, modelo, esfuerzo, directorio, tiempo, uso, imagenes)
 
 
 def modelos_codex(tiempo: int = 30) -> list[dict[str, Any]]:
@@ -551,9 +585,20 @@ def continuar_rfd(*, datos: dict[str, Any], contexto: list[Fuente], instruccion:
 
 
 def prompt_detalle(datos: dict[str, Any], requerimiento: dict[str, Any], fuentes: list[Fuente],
-                   analisis: dict[str, dict[str, Any]] | None = None, instruccion: str = "", reglas: str = "") -> str:
+                   analisis: dict[str, dict[str, Any]] | None = None, instruccion: str = "", reglas: str = "",
+                   maquetas: list[dict[str, Any]] | None = None) -> str:
     """Especificación de UNA opción: cabe completa en la respuesta en vez de comprimirse junto con todo el RFD."""
     opcion = {k: requerimiento[k] for k in ("id", "nombre", "parrafos", "referencia", "flujo", "criterios_aceptacion")}
+    bloque_maquetas = ""
+    if maquetas:
+        bloque_maquetas = (
+            "\nMAQUETAS DISPONIBLES (imágenes adjuntas, en este orden; título y texto bajo el que aparecen en su documento)\n"
+            + "\n".join(f"{i}. {m['archivo']} — {m.get('titulo') or 'sin título'}" + (f": «{m['contexto']}»" if m.get("contexto") else "")
+                        for i, m in enumerate(maquetas, 1))
+            + "\n- Lee de las maquetas de ESTA opción los filtros, columnas, indicadores, botones y campos de cada ventana.\n"
+            "- En «imagen» de cada ventana pon el archivo exacto de la maqueta que la muestra (p. ej. «img_03.png»); "
+            "cadena vacía si ninguna la muestra. No asignes maquetas de otra opción ni de otro portal.\n"
+        )
     otras = "\n".join(f"- {r['id']} {r['nombre']}" for r in datos["requerimientos"] if r["id"] != requerimiento["id"]) or "(ninguna)"
     modelo_autor = "\n\n".join(f"[{s['titulo']}]\n" + "\n".join(s["parrafos"]) for s in datos["secciones_generales"]) or "(sin secciones)"
     bloque_analisis = "\n".join(f"[{fid}] " + json.dumps(a, ensure_ascii=False) for fid, a in sorted((analisis or {}).items()))
@@ -575,6 +620,7 @@ QUÉ REDACTAR
 MODELO DE DETALLE DEL AUTOR (secciones ya redactadas: imita su estructura, profundidad y terminología; no copies hechos de otra opción salvo que también apliquen a ésta)
 {modelo_autor}
 
+{bloque_maquetas}
 OPCIÓN A DETALLAR
 {json.dumps(opcion, ensure_ascii=False)}
 
@@ -595,10 +641,11 @@ FUENTES COMPLETAS
 def detallar_requerimiento(*, datos: dict[str, Any], requerimiento: dict[str, Any], fuentes: list[Fuente],
                            analisis: dict[str, dict[str, Any]] | None, proveedor: str, modelo: str, directorio_salida: Path,
                            uso: Uso | None = None, esfuerzo: str = "", tiempo_limite: int = 1800, reglas: str = "",
-                           instruccion: str = "") -> dict[str, Any]:
+                           instruccion: str = "", maquetas: list[dict[str, Any]] | None = None,
+                           imagenes: list[Path] | None = None) -> dict[str, Any]:
     respuesta = invocar(proveedor=proveedor, modelo=modelo, esquema=SCHEMA_DETALLE, directorio=directorio_salida,
-                        prompt=prompt_detalle(datos, requerimiento, fuentes, analisis, instruccion, reglas),
-                        tiempo=tiempo_limite, uso=uso, esfuerzo=esfuerzo)
+                        prompt=prompt_detalle(datos, requerimiento, fuentes, analisis, instruccion, reglas, maquetas),
+                        tiempo=tiempo_limite, uso=uso, esfuerzo=esfuerzo, imagenes=imagenes or None)
     validar_contra(respuesta, SCHEMA_DETALLE, f"detalle de {requerimiento['id']}")
     return respuesta
 

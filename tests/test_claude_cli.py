@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -676,6 +677,7 @@ def _vista_portal_publico() -> dict:
         "ventanas": [{
             "nombre": "principal",
             "descripcion": "La ventana principal estará compuesta por el panel de filtros y la matriz de resultados.",
+            "imagen": "",
             "secciones": [{"nombre": "Matriz de resultados", "descripcion": "Presenta un registro por anticipo aplicado.",
                            "campos": [{"nombre": "Saldo de anticipo", "tipo": "Moneda (calculado)",
                                        "descripcion": "Valor del anticipo menos el valor aplicado, acumulado por Orden de Compra."}]}],
@@ -1440,6 +1442,7 @@ def proto(api, tmp_path, monkeypatch):
     monkeypatch.setattr(prototipo.os, "killpg", lambda *a: None, raising=False)
     monkeypatch.setattr(prototipo.os, "getpgid", lambda pid: pid, raising=False)
     monkeypatch.setattr(prototipo.shutil, "which", lambda nombre: None)
+    monkeypatch.setattr(prototipo, "capturar_pantallas_html", lambda html: [])
     api.proyecto = _proyecto_web(tmp_path, **{"src/estilos.css": ":root{--marca:#abcdef}"})
     api.gestor = gestor
     return api
@@ -1593,3 +1596,251 @@ def test_un_comando_escrito_como_texto_se_parte_en_argumentos(proto):
     id_ = _crear_proto(proto)
     assert proto.post(f"/api/prototipos/{id_}/levantar", json={"comando": "npm run dev"}).status_code == 200
     assert _ProcesoFalso.creados[-1].comando == ["npm", "run", "dev"]
+
+
+# ---------------------------------------------------------------- Prototipo desde el documento: maquetas del Word
+
+def _png(ancho: int, alto: int, semilla: int = 1) -> bytes:
+    """PNG de ruido (no comprime): sirve para superar el tamaño mínimo de una maqueta."""
+    import random
+    import struct
+    import zlib
+
+    azar = random.Random(semilla)
+    filas = b"".join(b"\x00" + bytes(azar.randrange(256) for _ in range(ancho * 3)) for _ in range(alto))
+
+    def trozo(tipo: bytes, datos: bytes) -> bytes:
+        return struct.pack(">I", len(datos)) + tipo + datos + struct.pack(">I", zlib.crc32(tipo + datos) & 0xFFFFFFFF)
+
+    return (b"\x89PNG\r\n\x1a\n" + trozo(b"IHDR", struct.pack(">IIBBBBB", ancho, alto, 8, 2, 0, 0, 0))
+            + trozo(b"IDAT", zlib.compress(filas)) + trozo(b"IEND", b""))
+
+
+def _docx_con_maquetas(ruta: Path) -> Path:
+    from docx import Document
+
+    imagenes = ruta.parent / "img"
+    imagenes.mkdir(parents=True, exist_ok=True)
+    (imagenes / "ui.png").write_bytes(_png(60, 60, 1))
+    (imagenes / "detalle.png").write_bytes(_png(50, 50, 2))
+    (imagenes / "icono.png").write_bytes(_png(2, 2, 3))
+    documento = Document()
+    documento.sections[0].header.paragraphs[0].add_run().add_picture(str(imagenes / "detalle.png"))  # logo del encabezado
+    documento.add_heading("Consulta de Facturas", level=1)
+    documento.add_heading("Ventana principal", level=2)
+    documento.add_paragraph("La ventana principal estará compuesta por el panel de filtros.")
+    documento.add_picture(str(imagenes / "ui.png"))
+    documento.add_picture(str(imagenes / "icono.png"))         # demasiado pequeña: ícono
+    documento.add_picture(str(imagenes / "ui.png"))            # repetida
+    documento.add_heading("Ventana Detalle", level=2)
+    documento.add_picture(str(imagenes / "detalle.png"))
+    documento.save(ruta)
+    return ruta
+
+
+def test_extrae_solo_las_maquetas_del_cuerpo_con_su_contexto(tmp_path):
+    from generador_rfd.imagenes import extraer_imagenes, leer_indice
+
+    docx = _docx_con_maquetas(tmp_path / "rfd.docx")
+    r = extraer_imagenes(docx, tmp_path / "salida")
+    assert [x["archivo"] for x in r] == ["img_01.png", "img_02.png"]
+    assert r[0]["titulo"] == "Consulta de Facturas › Ventana principal" and "panel de filtros" in r[0]["contexto"]
+    assert r[1]["titulo"] == "Consulta de Facturas › Ventana Detalle" and r[1]["origen"] == "rfd.docx"
+    assert (tmp_path / "salida" / "img_01.png").read_bytes() == _png(60, 60, 1)
+    assert leer_indice(tmp_path / "salida") == r
+    # Un segundo documento suma sus maquetas sin pisar las anteriores ni repetirlas.
+    otro = _docx_con_maquetas(tmp_path / "otro" / "otro.docx")
+    assert extraer_imagenes(otro, tmp_path / "salida") == r
+    assert extraer_imagenes(tmp_path / "salida" / "img_01.png", tmp_path / "x") == []
+
+
+def test_claude_recibe_las_imagenes_como_bloques_de_la_entrada(tmp_path, monkeypatch):
+    import base64
+    from types import SimpleNamespace
+
+    from generador_rfd import modelo
+
+    imagen = tmp_path / "ui.png"
+    imagen.write_bytes(_png(4, 4))
+    llamadas = []
+
+    def run_falso(comando, input, **k):
+        llamadas.append((comando, input))
+        resultado = {"type": "result", "is_error": False, "structured_output": {"ok": "si"}, "usage": {}}
+        salida = json.dumps(resultado) if "stream-json" not in comando else json.dumps({"type": "system"}) + "\n" + json.dumps(resultado)
+        return SimpleNamespace(stdout=salida, stderr="", returncode=0)
+
+    monkeypatch.setattr(modelo.shutil, "which", lambda n: "claude")
+    monkeypatch.setattr(modelo.subprocess, "run", run_falso)
+    esquema = {"type": "object", "properties": {"ok": {"type": "string"}}, "required": ["ok"], "additionalProperties": False}
+    assert modelo.invocar(proveedor="claude", modelo="haiku", prompt="TEXTO", esquema=esquema, directorio=tmp_path, imagenes=[imagen]) == {"ok": "si"}
+    comando, entrada = llamadas[0]
+    assert comando[comando.index("--input-format") + 1] == "stream-json" and "--verbose" in comando
+    contenido = json.loads(entrada)["message"]["content"]
+    assert contenido[0]["source"] == {"type": "base64", "media_type": "image/png", "data": base64.b64encode(imagen.read_bytes()).decode()}
+    assert contenido[-1] == {"type": "text", "text": "TEXTO"}
+    modelo.invocar(proveedor="claude", modelo="haiku", prompt="SOLO", esquema=esquema, directorio=tmp_path)
+    assert "--input-format" not in llamadas[1][0] and llamadas[1][1] == "SOLO"
+
+
+def test_codex_adjunta_las_imagenes_con_su_opcion(tmp_path):
+    from generador_rfd.modelo import comando_codex
+
+    imagen = tmp_path / "ui.png"
+    c = comando_codex("codex", "codex", "", "", tmp_path, tmp_path / "e.json", tmp_path / "r.json", imagenes=[imagen])
+    assert c[c.index("--image") + 1] == str(imagen) and c[-1] == "-"
+    assert "--image" not in comando_codex("codex", "codex", "", "", tmp_path, tmp_path / "e.json", tmp_path / "r.json")
+
+
+def _modelo_falso_con_imagenes(monkeypatch, respuestas):
+    from generador_rfd import prototipo
+
+    recibidos = []
+
+    def invocar_falso(*, prompt, imagenes=None, **k):
+        recibidos.append({"prompt": prompt, "imagenes": list(imagenes or [])})
+        return respuestas.pop(0)
+
+    monkeypatch.setattr(prototipo, "invocar", invocar_falso)
+    return recibidos
+
+
+def test_prototipo_de_documento_no_exige_proyecto_y_usa_las_maquetas(tmp_path, monkeypatch):
+    from generador_rfd import prototipo
+
+    raiz = tmp_path / "prototipos"
+    id_ = prototipo.crear_prototipo(raiz, None, modo="documento")
+    carpeta = raiz / id_
+    assert prototipo.leer_meta(carpeta)["modo"] == "documento" and prototipo.leer_meta(carpeta)["ruta"] == ""
+    agregadas = prototipo.agregar_imagenes(carpeta, _docx_con_maquetas(tmp_path / "rfd.docx"))
+    assert [x["archivo"] for x in agregadas] == ["img_01.png", "img_02.png"] == [x["archivo"] for x in prototipo.imagenes_de(carpeta)]
+    recibidos = _modelo_falso_con_imagenes(monkeypatch, [{"html": _html_proto(), "resumen": "Consulta armada."}])
+    r = prototipo.turno(carpeta, "Arma la consulta", proveedor="claude", modelo="", directorio=tmp_path, imagenes=["img_02.png"])
+    assert r["version"] == 1
+    (p,) = recibidos
+    assert p["imagenes"] == [carpeta / "imagenes" / "img_02.png"]
+    assert "MAQUETAS DEL DOCUMENTO" in p["prompt"] and "Consulta de Facturas › Ventana Detalle" in p["prompt"]
+    assert "Diseño del proyecto ORIGINAL" not in p["prompt"]
+    with pytest.raises(ValueError, match="imagen"):
+        prototipo.turno(carpeta, "otra", proveedor="claude", modelo="", directorio=tmp_path, imagenes=["../meta.json"])
+    with pytest.raises(ValueError, match="modo"):
+        prototipo.crear_prototipo(raiz, None, modo="otro")
+    with pytest.raises(ValueError, match="carpeta"):
+        prototipo.crear_prototipo(raiz, None)  # el modo proyecto sigue exigiendo la carpeta
+
+
+def test_api_prototipo_de_documento_toma_las_maquetas_del_rfd(proto, tmp_path, monkeypatch):
+    rfd_id, _ = _importar_por_api(proto, tmp_path, monkeypatch)
+    _docx_con_maquetas(Path(servidor.almacen().obtener(rfd_id)["ruta_docx"]))  # el Word del autor trae las maquetas
+    r = proto.post("/api/prototipos", json={"modo": "documento", "rfd_id": rfd_id})
+    assert r.status_code == 200, r.text
+    id_ = r.json()["id"]
+    d = proto.get(f"/api/prototipos/{id_}").json()
+    assert d["modo"] == "documento" and [x["archivo"] for x in d["imagenes"]] == ["img_01.png", "img_02.png"]
+    img = proto.get(f"/api/prototipos/{id_}/imagenes/img_01.png")
+    assert img.status_code == 200 and img.headers["content-type"] == "image/png"
+    for malo in ("..%2Fmeta.json", "meta.json", "img_09.png", "imagenes.json"):
+        assert proto.get(f"/api/prototipos/{id_}/imagenes/{malo}").status_code == 404
+    assert proto.post(f"/api/prototipos/{id_}/levantar", json={"comando": ["npm", "run", "dev"]}).status_code == 400
+    extra = _docx_con_maquetas(tmp_path / "extra" / "pagos.docx")
+    subida = proto.post(f"/api/prototipos/{id_}/imagenes", files=[("archivos", ("pagos.docx", extra.read_bytes()))])
+    assert subida.status_code == 200 and len(subida.json()["imagenes"]) == 2, "las repetidas no se suman"
+    recibidos = _modelo_falso_con_imagenes(monkeypatch, [{"html": _html_proto(), "resumen": "Listo."}])
+    t = _esperar(proto, proto.post(f"/api/prototipos/{id_}/mensaje", data={"texto": "Arma la consulta", "proveedor": "claude",
+                                                                           "imagenes": "img_01.png,img_02.png"}).json()["id"])
+    assert t["estado"] == "listo", t.get("error")
+    assert [p.name for p in recibidos[0]["imagenes"]] == ["img_01.png", "img_02.png"]
+    assert proto.post("/api/prototipos", json={"modo": "documento"}).json()["id"]
+
+
+# ---------------------------------------------------------------- Word con la UI de cada ventana
+
+def _medios_del_word(ruta: Path) -> tuple[dict[str, bytes], str, str, str]:
+    with ZipFile(ruta) as z:
+        medios = {n: z.read(n) for n in z.namelist() if n.startswith("word/media/ui_")}
+        return (medios, z.read("word/document.xml").decode("utf-8"), z.read("word/_rels/document.xml.rels").decode("utf-8"),
+                z.read("[Content_Types].xml").decode("utf-8"))
+
+
+def test_word_inserta_la_maqueta_de_cada_ventana(tmp_path):
+    from generador_rfd.imagenes import agregar_imagen, directorio_ui
+
+    datos = _con_especificacion()
+    ui = directorio_ui(tmp_path, datos["codigo"])
+    principal = agregar_imagen(ui, _png(40, 30, 7), "Consulta › Ventana principal", "", "rfd.docx")
+    detalle = agregar_imagen(ui, _png(30, 40, 8), "Prototipo › RF-01 · Detalle", "", "prototipo v1")
+    ventanas = datos["requerimientos"][0]["vistas"][0]["ventanas"]
+    ventanas[0]["imagen"] = principal["archivo"]
+    ventanas.append({"nombre": "Detalle", "descripcion": "Ventana emergente.", "imagen": "", "secciones": []})
+    r = publicar(datos, tmp_path / "RFD.docx")
+    medios, documento, rels, tipos = _medios_del_word(r.salida)
+    assert sorted(medios.values()) == sorted([_png(40, 30, 7), _png(30, 40, 8)]), "la del prototipo se asocia por RF y ventana"
+    for nombre in medios:
+        rid = re.search(rf'Id="(\w+)"[^>]*Target="media/{Path(nombre).name}"', rels).group(1)
+        assert f'r:embed="{rid}"' in documento
+    assert 'Extension="png"' in tipos
+    texto = texto_docx(r.salida)
+    assert texto.index("Definiciones de la ventana principal") < texto.index("Matriz de resultados")
+    # Sin carpeta de UI, el Word se arma igual y sin imágenes.
+    datos2 = _con_especificacion()
+    datos2["codigo"] = "SIN-UI"
+    assert _medios_del_word(publicar(datos2, tmp_path / "otro" / "RFD.docx").salida)[0] == {}
+
+
+def test_el_detalle_ve_las_maquetas_y_asigna_la_imagen_de_cada_ventana(tmp_path, monkeypatch):
+    from generador_rfd.imagenes import directorio_ui, leer_indice
+    from generador_rfd.modelo import prompt_detalle
+
+    datos = _demo_normalizado()
+    maquetas = [{"archivo": "img_01.png", "titulo": "Portal Público: Control de Anticipos › Ventana principal", "contexto": "Matriz"}]
+    prompt = prompt_detalle(datos, datos["requerimientos"][0], [], maquetas=maquetas)
+    assert "MAQUETAS DISPONIBLES" in prompt and "img_01.png" in prompt and "«imagen»" in prompt
+    # Al continuar, las maquetas del Word del autor y de los documentos de contexto llegan al detalle como imágenes.
+    base = _demo_normalizado()
+    _docx_con_maquetas(tmp_path / "RFD_DEMO.docx")
+    recibido: dict = {}
+
+    def detallar_falso(*, requerimiento, maquetas=None, imagenes=None, **_):
+        recibido.setdefault("maquetas", maquetas)
+        recibido.setdefault("imagenes", imagenes)
+        return {"vistas": [], "integraciones": [], "secciones_reemplazadas": []}
+
+    from generador_rfd import pipeline
+
+    monkeypatch.setattr(pipeline, "continuar_rfd", lambda *, datos, **_: _sin_version(datos))
+    monkeypatch.setattr(pipeline, "asegurar_calidad", _calidad_falsa())
+    monkeypatch.setattr(pipeline, "detallar_requerimiento", detallar_falso)
+    pipeline.continuar(pipeline.OpcionesMejora(base=tmp_path / "RFD_DEMO.docx", salida_dir=tmp_path, datos_base=base, revisar_word=False))
+    ui = directorio_ui(tmp_path, base["codigo"])
+    assert [m["archivo"] for m in recibido["maquetas"]] == ["img_01.png", "img_02.png"] == [m["archivo"] for m in leer_indice(ui)]
+    assert recibido["imagenes"] == [ui / "img_01.png", ui / "img_02.png"]
+
+
+def test_adjuntar_el_prototipo_guarda_cada_pantalla_como_imagen_del_rfd(proto, tmp_path, monkeypatch):
+    from generador_rfd import prototipo
+    from generador_rfd.imagenes import directorio_ui, leer_indice
+
+    rfd_id, _ = _importar_por_api(proto, tmp_path, monkeypatch)
+    _modelo_falso(monkeypatch, [{"html": _html_proto("Uno"), "resumen": "a"}])
+    id_ = _crear_proto(proto, rfd_id)
+    _esperar(proto, proto.post(f"/api/prototipos/{id_}/mensaje", data={"texto": "uno", "proveedor": "claude"}).json()["id"])
+    capturadas = []
+
+    def capturar_falso(html):
+        capturadas.append(html.name)
+        return [("RF-01 · principal", _png(20, 20, 4)), ("RF-01 · Detalle", _png(20, 20, 5))]
+
+    monkeypatch.setattr(prototipo, "capturar_pantallas_html", capturar_falso)
+    r = proto.post(f"/api/prototipos/{id_}/adjuntar-rfd", json={"version": 1})
+    assert r.status_code == 200, r.text
+    assert r.json()["pantallas"] == 2 and capturadas == ["v1.html"]
+    base = servidor.almacen().obtener(rfd_id)
+    ui = directorio_ui(Path(base["ruta_docx"]).parent, base["codigo"])
+    assert [m["titulo"] for m in leer_indice(ui)] == ["Prototipo › RF-01 · principal", "Prototipo › RF-01 · Detalle"]
+
+    def sin_playwright(html):
+        raise RuntimeError(prototipo.INSTALAR_PLAYWRIGHT)
+
+    monkeypatch.setattr(prototipo, "capturar_pantallas_html", sin_playwright)
+    r = proto.post(f"/api/prototipos/{id_}/adjuntar-rfd", json={"version": 1})
+    assert r.status_code == 200 and r.json()["pantallas"] == 0 and "pip install" in r.json()["aviso"]

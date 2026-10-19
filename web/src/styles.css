@@ -457,6 +457,10 @@ main[hidden] { display: none; }
 .pregunta-texto { margin: 4px 0 8px; font-size: 13.5px; font-weight: 560; }
 .pregunta-item textarea { width: 100%; resize: vertical; min-height: 44px; padding: 8px 10px; border: 1px solid var(--borde-fuerte); border-radius: 8px;
   background: var(--superficie); color: var(--texto); font: inherit; font-size: 13px; }
+.campo textarea { width: 100%; resize: vertical; min-height: 64px; padding: 9px 11px; border: 1px solid var(--borde-fuerte); border-radius: 10px;
+  background: var(--superficie); color: var(--texto); font: inherit; font-size: 13px; }
+.campo textarea:focus { outline: none; border-color: var(--primario); box-shadow: 0 0 0 3px var(--primario-suave); }
+.rejilla-1 { display: grid; gap: 14px; }
 .pregunta-item textarea:focus { outline: none; border-color: var(--primario); box-shadow: 0 0 0 3px var(--primario-suave); }
 .guardado { position: absolute; right: 14px; bottom: 6px; font-size: 11px; color: var(--ok); }
 .guardado.error { color: var(--error); }
@@ -571,3 +575,32 @@ main[hidden] { display: none; }
 .puente-estado.ok { color: var(--ok); }
 .puente-estado.atencion { color: var(--atencion); }
 .puente-estado.error { color: var(--error); }
+
+/* Prototipo de UI */
+.maquetas { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 8px; margin: 10px 0; }
+.maqueta { position: relative; display: flex; flex-direction: column; gap: 4px; padding: 6px; border: 1px solid var(--borde); border-radius: 10px;
+  background: var(--superficie-2); cursor: pointer; color: var(--texto-2); text-decoration: none; }
+.maqueta.activa { border-color: var(--primario); box-shadow: 0 0 0 2px var(--primario-suave); }
+.maqueta input { position: absolute; top: 9px; left: 9px; accent-color: var(--primario); }
+.maqueta img { width: 100%; height: 72px; object-fit: cover; object-position: top; border-radius: 6px; background: var(--superficie); }
+.maqueta span { font-size: 11px; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.acciones-maquetas { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+.fila-entrada { display: flex; gap: 6px; }
+.fila-entrada input { flex: 1; min-width: 0; }
+.ruta-proyecto code { font-family: var(--mono); font-size: 11.5px; color: var(--texto-3); word-break: break-all; }
+.chip-estado.activo { background: var(--ok-suave); color: var(--ok); }
+.chip-estado.error { background: var(--error-suave); color: var(--error); }
+.chip-estado.detenido { background: var(--superficie); color: var(--texto-3); border: 1px solid var(--borde); }
+.log-proceso { max-height: 140px; overflow: auto; margin: 8px 0; padding: 8px 10px; border-radius: 8px; background: var(--superficie-2);
+  border: 1px solid var(--borde); font-family: var(--mono); font-size: 11px; color: var(--texto-2); white-space: pre-wrap; }
+.columna-panel select { width: 100%; padding: 9px 11px; border: 1px solid var(--borde-fuerte); border-radius: 9px;
+  background: var(--superficie); color: var(--texto); font: inherit; font-size: 13px; }
+.estado-trabajo { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--texto-2); }
+.chips-version { display: flex; gap: 4px; flex-wrap: wrap; }
+.chips-version button { padding: 2px 9px; border-radius: 999px; border: 1px solid var(--borde); background: none; color: var(--texto-2);
+  font: inherit; font-size: 12px; cursor: pointer; }
+.chips-version button.activo { border-color: var(--primario); background: var(--primario-suave); color: var(--primario); }
+.vista-prototipo { width: 100%; height: 360px; margin-top: 8px; border: 1px solid var(--borde); border-radius: 10px; background: #fff; }
+.chat-proto { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
+.chat-proto li { padding: 8px 10px; border-radius: 9px; background: var(--superficie-2); color: var(--texto-2); }
+.chat-proto li.usuario { background: var(--primario-suave); color: var(--texto); }

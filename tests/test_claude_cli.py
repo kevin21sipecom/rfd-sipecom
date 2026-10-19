@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -18,7 +19,7 @@ import pytest
 from lxml import etree
 
 from generador_rfd import servidor
-from generador_rfd.fuentes import Fuente, cargar_fuentes, leer_documento
+from generador_rfd.fuentes import Fuente, cargar_fuentes
 from generador_rfd.modelo import analizar_fuentes, comando_claude, crear_prompt, temas_de_codigo
 from generador_rfd.pipeline import publicar, terminos_ajenos
 from generador_rfd.proyecto import inventario_repositorios
@@ -30,6 +31,17 @@ EJEMPLOS = RAIZ / "ejemplos"
 MODELO = os.environ.get("RFD_MODELO_TEST", "haiku")
 CLAUDE = shutil.which("claude")
 requiere_claude = pytest.mark.skipif(not CLAUDE, reason="Claude Code CLI no está en PATH")
+
+
+@pytest.fixture(autouse=True)
+def _sin_detalle_real(request, monkeypatch):
+    """El detalle por opción llama al modelo: fuera de las pruebas `claude` responde sin especificación."""
+    if request.node.get_closest_marker("claude"):
+        return
+    from generador_rfd import pipeline
+
+    monkeypatch.setattr(pipeline, "detallar_requerimiento",
+                        lambda **k: {"vistas": [], "integraciones": [], "secciones_reemplazadas": []})
 
 
 def test_comando_claude_va_aislado_y_sin_meta_esquema():
@@ -70,32 +82,108 @@ def test_lee_pdf_y_markdown(tmp_path):
         cargar_fuentes([], [vacio])
 
 
-def test_lee_excel_con_columnas_y_hojas_ocultas(tmp_path):
+def test_lee_excel_por_hoja_y_celda(tmp_path):
     from openpyxl import Workbook
-
     libro = Workbook()
     hoja = libro.active
-    hoja.title = "Requerimientos"
-    hoja.append(["ID", "Requerimiento", "Prioridad", "Responsable"])
-    hoja.append(["RQ-01", "Consultar saldo", "Alta", "Equipo SAP"])
-    hoja.append(["RQ-02", "Exportar PDF", None, "Equipo portal"])
-    oculta = libro.create_sheet("Parámetros")
-    oculta.append(["Clave", "Valor"])
-    oculta.sheet_state = "hidden"
-    ruta = tmp_path / "matriz.xlsx"
+    hoja.title = "Requisitos"
+    hoja["A1"], hoja["B1"] = "ID", "Descripción"
+    hoja["A2"], hoja["B2"] = "R-01", "Alta de solicitudes"
+    hoja["C2"] = 3
+    libro.create_sheet("Vacía")
+    ruta = tmp_path / "requisitos.xlsx"
     libro.save(ruta)
     fuentes = cargar_fuentes([], [ruta])
-    texto = fuentes[0].contenido
-    assert "H1: hoja «Requerimientos»" in texto and "H2: hoja «Parámetros» (oculta)" in texto
-    # La celda vacía de «Prioridad» conserva su columna: «Equipo portal» sigue siendo el responsable.
-    assert "H1F3: RQ-02 | Exportar PDF |  | Equipo portal" in texto
-    with pytest.raises(ValueError, match="guárdelo como .xlsx"):
-        leer_documento(_xls(tmp_path))
+    assert fuentes[0].contenido.splitlines() == [
+        "Requisitos!A1: ID",
+        "Requisitos!B1: Descripción",
+        "Requisitos!A2: R-01",
+        "Requisitos!B2: Alta de solicitudes",
+        "Requisitos!C2: 3",
+    ]
+    assert "Formato no admitido" not in fuentes[0].contenido
+    with pytest.raises(ValueError, match="no contiene texto extraíble"):
+        cargar_fuentes([], [_libro_vacio(tmp_path / "vacio.xlsx")])
 
 
-def _xls(tmp_path):
-    ruta = tmp_path / "viejo.xls"
-    ruta.write_bytes(bytes([0xD0, 0xCF, 0x11, 0xE0]))
+def test_excel_conserva_formulas_como_logica_de_calculo(tmp_path):
+    from openpyxl import Workbook
+    from generador_rfd.calidad import MARCA_FUENTE
+    from generador_rfd.modelo import prompt_analisis
+    libro = Workbook()
+    hoja = libro.active
+    hoja.title = "Calculo"
+    hoja["A1"], hoja["B1"], hoja["B2"] = "Total", 2, 3
+    hoja["B3"] = "=SUM(B1:B2)"
+    ruta = tmp_path / "formulas.xlsx"
+    libro.save(ruta)
+    # Sin valor guardado (nunca abierto en Excel): la fórmula se conserva igual.
+    assert "Calculo!B3: =SUM(B1:B2)" in cargar_fuentes([], [ruta])[0].contenido.splitlines()
+    # Con valor guardado: fórmula y resultado juntos.
+    hoja_valores = tmp_path / "con_valor.xlsx"
+    from zipfile import ZIP_DEFLATED
+    with ZipFile(ruta) as entrada, ZipFile(hoja_valores, "w", ZIP_DEFLATED) as salida:
+        for item in entrada.infolist():
+            datos = entrada.read(item.filename)
+            if item.filename == "xl/worksheets/sheet1.xml":
+                datos = datos.replace(b"<v></v>", b"<v>5</v>").replace(b"<v />", b"<v>5</v>")
+            salida.writestr(item, datos)
+    contenido = cargar_fuentes([], [hoja_valores])[0].contenido
+    assert "Calculo!B3: =SUM(B1:B2) [valor: 5]" in contenido.splitlines()
+    # El prompt de análisis exige registrar las fórmulas como reglas replicables.
+    prompt = prompt_analisis(cargar_fuentes([], [ruta])[0], "Cliente")
+    assert "fórmulas" in prompt and "replic" in prompt
+    # Una marca de hoja filtrada dentro de un texto del RFD se detecta como las demás.
+    assert MARCA_FUENTE.search("según F02 Calculo!B3 se suma")
+
+
+def test_avance_se_conserva_y_se_distingue_de_las_fuentes(tmp_path):
+    from docx import Document
+    from generador_rfd.calidad import MARCA_FUENTE
+    documento = Document()
+    documento.add_paragraph("2.1 Registro de solicitudes: el usuario ingresa el pedido desde el portal.")
+    ruta = tmp_path / "avance.docx"
+    documento.save(ruta)
+
+    solo = cargar_fuentes([], [], avances=[ruta])
+    assert [(f.id, f.categoria) for f in solo] == [("A01", "avance")]
+    con_reunion = cargar_fuentes([EJEMPLOS / "transcripcion_demo.txt"], [], avances=[ruta])
+    assert [f.id for f in con_reunion] == ["F01", "A01"]
+
+    prompt = crear_prompt(con_reunion, "", "Cliente", "C-1", "existente", "x", None)
+    assert "RFD EN AVANCE" in prompt and "literalmente" in prompt
+    assert prompt.count("2.1 Registro de solicitudes") == 1  # el avance no se repite en las fuentes completas
+    assert "No hay transcripción de reunión" in crear_prompt(solo, "", "Cliente", "C-1", "existente", "x", None)  # un avance no es una reunión
+    assert MARCA_FUENTE.search("según A01 P3")
+    assert MARCA_FUENTE.search("según F02 Hoja Datos!B3 se suma")
+
+    with pytest.raises(ValueError, match="nombres distintos"):
+        cargar_fuentes([], [ruta], avances=[ruta])
+    with pytest.raises(ValueError, match="al menos un archivo"):
+        cargar_fuentes([], [], avances=[])
+
+
+def test_excel_ignora_dimension_incorrecta_de_la_hoja(tmp_path):
+    from openpyxl import Workbook
+    from zipfile import ZIP_DEFLATED
+    libro = Workbook()
+    libro.active["A1"], libro.active["C5"] = "inicio", "fin"
+    original = tmp_path / "original.xlsx"
+    libro.save(original)
+    roto = tmp_path / "dimension_rota.xlsx"
+    with ZipFile(original) as entrada, ZipFile(roto, "w", ZIP_DEFLATED) as salida:
+        for item in entrada.infolist():
+            datos = entrada.read(item.filename)
+            if item.filename == "xl/worksheets/sheet1.xml":
+                datos = datos.replace(b'<dimension ref="A1:C5"/>', b'<dimension ref="A1"/>')
+                assert b'<dimension ref="A1"/>' in datos
+            salida.writestr(item, datos)
+    assert cargar_fuentes([], [roto])[0].contenido.splitlines() == ["Sheet!A1: inicio", "Sheet!C5: fin"]
+
+
+def _libro_vacio(ruta: Path) -> Path:
+    from openpyxl import Workbook
+    Workbook().save(ruta)
     return ruta
 
 
@@ -166,7 +254,7 @@ def test_inventario_de_varios_repositorios(tmp_path):
 def test_comando_codex_aislado_y_eventos(tmp_path):
     from generador_rfd.modelo import comando_codex, eventos_codex
 
-    nube = comando_codex("codex", "gpt-6-luna", "low", tmp_path, tmp_path / "e.json", tmp_path / "r.json")
+    nube = comando_codex("codex", "codex", "gpt-6-luna", "low", tmp_path, tmp_path / "e.json", tmp_path / "r.json")
     for opcion in ("--ephemeral", "--ignore-user-config", "--ignore-rules", "--json", "--output-schema"):
         assert opcion in nube
     assert nube[nube.index("--sandbox") + 1] == "read-only"
@@ -546,29 +634,1333 @@ def test_api_genera_word_con_varios_archivos(tmp_path, monkeypatch):
         time.sleep(3)
     assert t["estado"] == "listo", t.get("error")
     assert [f["nombre"] for f in t["fuentes"]] == ["transcripcion_demo.txt", "contexto_demo.docx", "presentacion_demo.pptx"]
-    assert t["uso"]["llamadas"] == 4, "tres análisis y una redacción"
+    assert t["uso"]["llamadas"] >= 4, "tres análisis, una redacción y el detalle de cada opción"
     word = cliente.get(f"/api/trabajos/{id_}/archivo/docx")
     assert word.status_code == 200 and word.content[:2] == b"PK"
     assert cliente.get(f"/api/trabajos/{id_}/archivo/analisis").status_code == 200
     assert (tmp_path / "RFD_TEST-API.revision.md").is_file()
 
 
-def test_excel_con_dimension_falsa_se_lee_completo(tmp_path):
-    import re
-    import zipfile
+# ---------------------------------------------------------------- Importar un RFD en avance y continuarlo
 
-    from openpyxl import Workbook
+def _docx_con_texto(ruta: Path, *parrafos: str) -> Path:
+    from docx import Document
 
-    libro = Workbook()
-    for i in range(5):
-        libro.active.append([f"a{i}", f"b{i}"])
-    base = tmp_path / "base.xlsx"
-    libro.save(base)
-    ruta = tmp_path / "dim_a1.xlsx"
-    with zipfile.ZipFile(base) as origen, zipfile.ZipFile(ruta, "w") as destino:
-        for n in origen.namelist():
-            datos = origen.read(n)
-            if n == "xl/worksheets/sheet1.xml":
-                datos = re.sub(rb'<dimension ref="[^"]*"', b'<dimension ref="A1"', datos)
-            destino.writestr(n, datos)
-    assert "H1F5: a4 | b4" in leer_documento(ruta)
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    documento = Document()
+    for p in parrafos:
+        documento.add_paragraph(p)
+    documento.save(ruta)
+    return ruta
+
+
+def _demo_normalizado() -> dict:
+    from generador_rfd.schema import normalizar
+
+    return normalizar(_demo_con_preguntas())
+
+
+def _sin_version(datos: dict) -> dict:
+    return json.loads(json.dumps({k: v for k, v in datos.items() if k not in ("version", "historial")}))
+
+
+def _calidad_falsa(puntaje: float = 1.0, criterios: list[dict] | None = None, vista: dict | None = None):
+    def falsa(datos, o, analisis, uso, directorio, avisar, con_codigo=None, preservar=""):
+        if vista is not None:
+            vista["preservar"] = preservar
+        return datos, {"puntaje": puntaje, "umbral": 0.85, "rondas": 0, "criterios": criterios or []}
+    return falsa
+
+
+def test_correccion_recibe_el_texto_del_autor_y_prohibe_reescribirlo():
+    from generador_rfd.modelo import prompt_correccion
+
+    datos = _demo_normalizado()
+    fallas = "- [RF-01.criterios] Criterios cortos. Situación actual: 3 palabras"
+    assert "TEXTO DEL AUTOR" not in prompt_correccion(datos, fallas, None)
+    prompt = prompt_correccion(datos, fallas, None, preservar="El portal valida el pedido. TEXTO-UNICO-DEL-AUTOR")
+    assert "TEXTO-UNICO-DEL-AUTOR" in prompt
+    assert "TEXTO DEL AUTOR (NO MODIFICAR)" in prompt and "agregó o completó" in prompt and "hallazgo" in prompt
+    assert prompt.index("TEXTO DEL AUTOR") < prompt.index("RFD ACTUAL")
+
+
+def test_asegurar_calidad_entrega_el_texto_del_autor_al_corrector(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from generador_rfd import pipeline
+    from generador_rfd.modelo import Uso
+
+    datos = _demo_normalizado()
+    datos["requerimientos"][0]["criterios_aceptacion"] = ["Muestra datos.", "Valida.", "Guarda.", "Envía."]
+    recibido: list[str] = []
+
+    def corregir_falso(*, datos, preservar="", **_):
+        recibido.append(preservar)
+        return json.loads(json.dumps(datos))
+
+    monkeypatch.setattr(pipeline, "corregir_rfd", corregir_falso)
+    o = SimpleNamespace(proveedor="claude", modelo="", esfuerzo="", rondas_calidad=1, reglas=[], proyecto=None)
+    pipeline.asegurar_calidad(datos, o, None, Uso(), tmp_path, lambda *a: None, preservar="TEXTO-AUTOR")
+    pipeline.asegurar_calidad(datos, o, None, Uso(), tmp_path, lambda *a: None)
+    assert recibido == ["TEXTO-AUTOR", ""]
+
+
+def test_generar_con_avance_protege_el_texto_del_autor_en_la_correccion(tmp_path, monkeypatch):
+    from generador_rfd import pipeline
+
+    avance = _docx_con_texto(tmp_path / "avance.docx", "2.1 Registro de solicitudes: TEXTO-AUTOR-UNICO")
+    monkeypatch.setattr(pipeline, "analizar_fuentes", lambda *a, **k: {})
+    monkeypatch.setattr(pipeline, "redactar_rfd", lambda **k: _demo_normalizado())
+    vista: dict = {}
+    monkeypatch.setattr(pipeline, "asegurar_calidad", _calidad_falsa(vista=vista))
+
+    def opciones(**extra):
+        return pipeline.Opciones(transcripciones=[], contextos=[EJEMPLOS / "contexto_demo.docx"], cliente="Cliente", codigo="C-1",
+                                 tipo_proyecto="existente", fecha="01/01/2026", salida=tmp_path / "RFD.docx", revisar_word=False, **extra)
+
+    pipeline.generar(opciones(avances=[avance]))
+    assert "TEXTO-AUTOR-UNICO" in vista["preservar"]
+    pipeline.generar(opciones())
+    assert vista["preservar"] == ""
+
+
+def test_prompt_continuacion_conserva_lo_escrito_y_no_exige_respuestas():
+    from generador_rfd.modelo import prompt_continuacion
+
+    datos = _demo_normalizado()
+    contexto = [Fuente("C01", "acta.txt", "contexto", "L1: CONTEXTO-NUEVO")]
+    prompt = prompt_continuacion(datos, contexto, "Enfócate en los criterios del RF-02")
+    for frase in ("literalmente", "«pendientes»", "«definiciones»", "por confirmar", "RF-xx", "terminología"):
+        assert frase in prompt
+    assert "CONTEXTO-NUEVO" in prompt and "Enfócate en los criterios del RF-02" in prompt
+    assert "RESPUESTAS DEL CLIENTE" not in prompt
+    from generador_rfd.calidad import MARCA_FUENTE
+    assert MARCA_FUENTE.search("según C01 P3")  # las marcas del contexto adicional tampoco van en los textos
+    vacio = prompt_continuacion(datos, [], "")
+    assert "(sin documentos adicionales)" in vacio and "(sin instrucción)" in vacio
+
+
+def test_continuar_completa_sin_respuestas_y_reporta_lo_que_no_cumple(tmp_path, monkeypatch):
+    from generador_rfd import pipeline
+
+    base = _demo_normalizado()
+    contexto = tmp_path / "contexto.txt"
+    contexto.write_text("El portal también debe validar el país.", encoding="utf-8")
+    recibido: dict = {}
+
+    def continuar_falso(*, datos, contexto, instruccion, **_):
+        recibido.update(contexto=contexto, instruccion=instruccion)
+        nuevo = _sin_version(datos)
+        nuevo["alcance"]["introduccion"] = ["El alcance se completó con el contexto adicional."]
+        nuevo["cambios"] = [{"pregunta": "Continuación", "seccion": "1.3 Alcance", "cambio": "Se completa el alcance."}]
+        return nuevo
+
+    criterios = [{"id": "RF-01.criterios", "descripcion": "Criterios de 15 a 45 palabras", "ok": False, "detalle": "3 palabras"},
+                 {"id": "sin_marcas", "descripcion": "Sin marcas de fuente", "ok": True, "detalle": ""}]
+    monkeypatch.setattr(pipeline, "continuar_rfd", continuar_falso)
+    monkeypatch.setattr(pipeline, "asegurar_calidad", _calidad_falsa(0.5, criterios, recibido))
+    r = pipeline.continuar(pipeline.OpcionesMejora(base=tmp_path / "RFD_DEMO.docx", salida_dir=tmp_path, adjuntos=[contexto],
+                                                   instruccion="Enfócate en RF-02", datos_base=base, revisar_word=False))
+    assert r.salida.name == "RFD_DEMO_v0.2.docx"
+    assert r.datos["version"] == "0.2" and "ontinuación" in r.datos["historial"][-1]["descripcion"]
+    assert [f.nombre for f in recibido["contexto"]] == ["contexto.txt"] and recibido["instruccion"] == "Enfócate en RF-02"
+    assert json.dumps(base["titulo"], ensure_ascii=False)[1:-1] in recibido["preservar"]
+    assert any(h.codigo == "calidad_texto_autor" and "RF-01.criterios" in h.mensaje for h in r.hallazgos)
+    assert not any("sin_marcas" in h.mensaje for h in r.hallazgos)
+    # Sin contexto ni instrucción también es válido: no depende de respuestas del cliente.
+    sola = pipeline.continuar(pipeline.OpcionesMejora(base=tmp_path / "RFD_DEMO.docx", salida_dir=tmp_path, datos_base=base, revisar_word=False))
+    assert sola.datos["version"] == "0.2" and recibido["contexto"] == []
+
+
+def test_continuar_avisa_si_la_ia_elimina_un_requerimiento_del_autor(tmp_path, monkeypatch):
+    from generador_rfd import pipeline
+
+    base = _demo_normalizado()
+
+    def continuar_falso(*, datos, **_):
+        nuevo = _sin_version(datos)
+        nuevo["requerimientos"] = nuevo["requerimientos"][1:]
+        return nuevo
+
+    monkeypatch.setattr(pipeline, "continuar_rfd", continuar_falso)
+    monkeypatch.setattr(pipeline, "asegurar_calidad", _calidad_falsa())
+    r = pipeline.continuar(pipeline.OpcionesMejora(base=tmp_path / "RFD_DEMO.docx", salida_dir=tmp_path, datos_base=base, revisar_word=False))
+    assert any(h.codigo == "rf_eliminado" and base["requerimientos"][0]["id"] in h.mensaje for h in r.hallazgos)
+
+
+# ---------------------------------------------------------------- Especificación detallada por opción
+
+def _vista_portal_publico() -> dict:
+    return {
+        "portal": "Portal Público",
+        "definiciones_generales": ["Permitirá al proveedor consultar los anticipos asociados a sus Órdenes de Compra."],
+        "ventanas": [{
+            "nombre": "principal",
+            "descripcion": "La ventana principal estará compuesta por el panel de filtros y la matriz de resultados.",
+            "imagen": "",
+            "secciones": [{"nombre": "Matriz de resultados", "descripcion": "Presenta un registro por anticipo aplicado.",
+                           "campos": [{"nombre": "Saldo de anticipo", "tipo": "Moneda (calculado)",
+                                       "descripcion": "Valor del anticipo menos el valor aplicado, acumulado por Orden de Compra."}]}],
+        }],
+        "reglas_negocio": ["Los anticipos no podrán cruzarse entre empresas diferentes."],
+    }
+
+
+def _con_especificacion() -> dict:
+    datos = _demo_normalizado()
+    datos["requerimientos"][0]["vistas"] = [_vista_portal_publico()]
+    datos["requerimientos"][0]["integraciones"] = [
+        {"servicio": "Servicio de consulta de anticipos", "descripcion": "Retorna los anticipos por Orden de Compra."}]
+    return datos
+
+
+def test_esquema_admite_especificacion_y_normaliza_un_rfd_anterior():
+    from generador_rfd.schema import normalizar, validar_estructura
+
+    anterior = json.loads((EJEMPLOS / "rfd_demo.json").read_text(encoding="utf-8"))
+    for r in anterior["requerimientos"]:
+        r.pop("vistas", None), r.pop("integraciones", None)
+    datos = normalizar(anterior)
+    validar_estructura(datos)
+    assert all(r["vistas"] == [] and r["integraciones"] == [] for r in datos["requerimientos"])
+    validar_estructura(_con_especificacion())
+
+
+def test_word_presenta_la_especificacion_detallada_de_la_opcion(tmp_path):
+    r = publicar(_con_especificacion(), tmp_path / "RFD.docx")
+    texto = texto_docx(r.salida)
+    for frase in ("Definiciones generales (Portal Público)", "Definiciones de la ventana principal (Portal Público)",
+                  "Matriz de resultados", "Saldo de anticipo", "Moneda (calculado)", "Reglas de negocio (Portal Público)",
+                  "Los anticipos no podrán cruzarse entre empresas diferentes.", "Integraciones", "Servicio de consulta de anticipos"):
+        assert frase in texto, frase
+    assert texto.index("Reglas de negocio (Portal Público)") < texto.index("Flujo propuesto")
+    assert not any(h.codigo == "especificacion_incompleta" for h in r.hallazgos)
+
+
+def test_especificacion_sin_reglas_ni_ventanas_se_informa():
+    from generador_rfd.schema import auditar_contenido
+
+    datos = _con_especificacion()
+    datos["requerimientos"][0]["vistas"][0]["reglas_negocio"] = []
+    assert any(h.codigo == "especificacion_incompleta" and "RF-01" in h.mensaje for h in auditar_contenido(datos))
+
+
+def test_prompt_de_detalle_se_enfoca_en_una_opcion_e_imita_al_autor():
+    from generador_rfd.modelo import prompt_detalle
+
+    datos = _demo_normalizado()
+    datos["secciones_generales"] = [{"titulo": "2.1.1. Consulta de Facturas", "parrafos": ["MODELO-DEL-AUTOR con ventana principal."]}]
+    fuentes = [Fuente("C01", "transcripcion.docx", "contexto", "L1: TRANSCRIPCION-REUNION")]
+    prompt = prompt_detalle(datos, datos["requerimientos"][1], fuentes, instruccion="Detalla Control de Anticipos")
+    assert datos["requerimientos"][1]["nombre"] in prompt
+    for texto in ("MODELO-DEL-AUTOR", "TRANSCRIPCION-REUNION", "Detalla Control de Anticipos", "secciones_reemplazadas",
+                  "reglas_negocio", datos["requerimientos"][0]["nombre"]):
+        assert texto in prompt, texto
+    assert prompt.index("OPCIÓN A DETALLAR") < prompt.index("FUENTES COMPLETAS")
+
+
+def _base_con_resumen(extension: int) -> dict:
+    base = _demo_normalizado()
+    base["secciones_generales"].append({"titulo": "2.1.4. Opción Registro de solicitudes", "parrafos": [" ".join(["resumen"] * extension)]})
+    base["requerimientos"][3]["vistas"] = [_vista_portal_publico()]
+    return base
+
+
+def _continuar_con_detalle(tmp_path, monkeypatch, base: dict, detalle):
+    from generador_rfd import pipeline
+
+    llamados: list[str] = []
+
+    def detallar_falso(*, requerimiento, fuentes, **_):
+        llamados.append(requerimiento["id"])
+        return detalle(requerimiento)
+
+    contexto = tmp_path / "transcripcion.txt"
+    contexto.write_text("Se definió el saldo de anticipo por Orden de Compra.", encoding="utf-8")
+    monkeypatch.setattr(pipeline, "continuar_rfd", lambda *, datos, **_: _sin_version(datos))
+    monkeypatch.setattr(pipeline, "asegurar_calidad", _calidad_falsa())
+    monkeypatch.setattr(pipeline, "detallar_requerimiento", detallar_falso)
+    r = pipeline.continuar(pipeline.OpcionesMejora(base=tmp_path / "RFD_DEMO.docx", salida_dir=tmp_path, adjuntos=[contexto],
+                                                   datos_base=base, revisar_word=False))
+    return r, llamados
+
+
+def test_continuar_detalla_cada_opcion_y_reemplaza_su_resumen(tmp_path, monkeypatch):
+    def detalle(req):
+        if req["id"] != "RF-01":
+            return {"vistas": [], "integraciones": [], "secciones_reemplazadas": []}
+        return {"vistas": [_vista_portal_publico()], "integraciones": [],
+                "secciones_reemplazadas": ["2.1.4. Opción Registro de solicitudes", "Título inexistente"]}
+
+    r, llamados = _continuar_con_detalle(tmp_path, monkeypatch, _base_con_resumen(8), detalle)
+    assert llamados == ["RF-01", "RF-02", "RF-03"], "una llamada por opción sin especificación"
+    assert r.datos["requerimientos"][0]["vistas"][0]["portal"] == "Portal Público"
+    assert "2.1.4. Opción Registro de solicitudes" not in [s["titulo"] for s in r.datos["secciones_generales"]]
+    assert any(c["seccion"].startswith("RF-01") and "especificación detallada" in c["cambio"] for c in r.datos["cambios"])
+    assert "Saldo de anticipo" in texto_docx(r.salida)
+
+
+def test_el_detalle_no_reemplaza_una_seccion_mas_extensa_que_el(tmp_path, monkeypatch):
+    def detalle(req):
+        return {"vistas": [_vista_portal_publico()], "integraciones": [],
+                "secciones_reemplazadas": ["2.1.4. Opción Registro de solicitudes"]}
+
+    r, _ = _continuar_con_detalle(tmp_path, monkeypatch, _base_con_resumen(400), detalle)
+    assert "2.1.4. Opción Registro de solicitudes" in [s["titulo"] for s in r.datos["secciones_generales"]]
+
+
+def test_una_falla_al_detallar_no_bloquea_la_version(tmp_path, monkeypatch):
+    def detalle(req):
+        raise RuntimeError("tiempo agotado")
+
+    r, llamados = _continuar_con_detalle(tmp_path, monkeypatch, _base_con_resumen(8), detalle)
+    assert r.salida.is_file() and len(llamados) == 3
+    assert sum(h.codigo == "detalle_no_generado" for h in r.hallazgos) == 3
+
+
+def test_la_revision_editorial_no_altera_la_especificacion(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from generador_rfd import pipeline
+    from generador_rfd.modelo import Uso
+
+    datos = _con_especificacion()
+    datos["requerimientos"][0]["criterios_aceptacion"] = ["Muestra datos.", "Valida.", "Guarda.", "Envía."]
+
+    def corregir_falso(*, datos, **_):
+        nuevo = json.loads(json.dumps(datos))
+        nuevo["requerimientos"][0]["vistas"] = []
+        nuevo["requerimientos"][0]["integraciones"] = []
+        return nuevo
+
+    monkeypatch.setattr(pipeline, "corregir_rfd", corregir_falso)
+    o = SimpleNamespace(proveedor="claude", modelo="", esfuerzo="", rondas_calidad=1, reglas=[], proyecto=None)
+    mejor, _ = pipeline.asegurar_calidad(datos, o, None, Uso(), tmp_path, lambda *a: None)
+    assert mejor["requerimientos"][0]["vistas"] == [_vista_portal_publico()]
+    assert mejor["requerimientos"][0]["integraciones"][0]["servicio"] == "Servicio de consulta de anticipos"
+
+
+def test_importar_rechaza_archivos_invalidos(tmp_path):
+    from docx import Document
+
+    from generador_rfd import pipeline
+
+    texto = tmp_path / "avance.txt"
+    texto.write_text("hola", encoding="utf-8")
+    roto = tmp_path / "roto.docx"
+    roto.write_bytes(b"esto no es un zip")
+    vacio = tmp_path / "vacio.docx"
+    Document().save(vacio)
+    with pytest.raises(ValueError, match=r"Sólo se admite.*\.docx"):
+        pipeline.leer_avance(texto)
+    with pytest.raises(ValueError, match="No se pudo leer"):
+        pipeline.leer_avance(roto)
+    with pytest.raises(ValueError, match="no contiene texto"):
+        pipeline.leer_avance(vacio)
+    assert "Capítulo 1" in pipeline.leer_avance(_docx_con_texto(tmp_path / "bien.docx", "Capítulo 1"))
+
+
+def test_importar_reconstruye_el_word_y_lo_deja_enlazado(tmp_path, monkeypatch):
+    from generador_rfd import pipeline
+
+    original = _docx_con_texto(tmp_path / "entrada" / "mi avance.docx", "(RFD-9)", "Portal de pedidos", "2.1 Registro de solicitudes")
+    visto: dict = {}
+
+    def reconstruir_falso(*, texto, cliente, codigo, **_):
+        visto.update(texto=texto, cliente=cliente, codigo=codigo)
+        return _demo_normalizado()
+
+    monkeypatch.setattr(pipeline, "reconstruir_rfd", reconstruir_falso)
+
+    def importar():
+        return pipeline.importar(pipeline.OpcionesImportacion(archivo=original, salida_dir=tmp_path / "salidas", cliente="Cliente X",
+                                                              codigo="RFD-9", titulo="Mi título"))
+
+    r = importar()
+    assert visto["cliente"] == "Cliente X" and visto["codigo"] == "RFD-9" and "2.1 Registro" in visto["texto"]
+    assert r.salida.name == "RFD_RFD-9_importado.docx" and r.salida.read_bytes() == original.read_bytes()
+    assert r.datos["titulo"] == "Mi título" and r.datos["version"] == "0.1"
+    assert r.salida.with_suffix(".json").is_file() and r.calidad["criterios"]
+    # Importar de nuevo el mismo código no pisa el registro anterior.
+    segunda = importar()
+    assert segunda.salida != r.salida and r.salida.is_file() and segunda.salida.is_file()
+
+
+@pytest.fixture
+def api(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from generador_rfd.almacen import Almacen
+
+    monkeypatch.setattr(servidor, "SALIDAS", tmp_path / "salidas")
+    monkeypatch.setattr(servidor, "_almacen", Almacen(tmp_path / "rfd.db"))
+    return TestClient(servidor.app)
+
+
+def _esperar(cliente, id_: str) -> dict:
+    limite = time.time() + 30
+    while (t := cliente.get(f"/api/trabajos/{id_}").json())["estado"] == "en_curso":
+        assert time.time() < limite, "el trabajo no terminó"
+        time.sleep(0.05)
+    return t
+
+
+def _importar_por_api(cliente, tmp_path, monkeypatch) -> tuple[int, bytes]:
+    from generador_rfd import pipeline
+
+    contenido = _docx_con_texto(tmp_path / "avance.docx", "(RFD-9)", "2.1 Registro de solicitudes").read_bytes()
+    monkeypatch.setattr(pipeline, "reconstruir_rfd", lambda *, cliente, codigo, **k: {**_demo_normalizado(), "cliente": cliente, "codigo": codigo})
+    r = cliente.post("/api/rfds/importar", files=[("archivo", ("avance.docx", contenido))], data={
+        "cliente": "Cliente X", "codigo": "RFD-9", "proveedor": "claude", "modelo": "haiku"})
+    assert r.status_code == 200, r.text
+    t = _esperar(cliente, r.json()["id"])
+    assert t["estado"] == "listo", t.get("error")
+    return t["resultado"]["rfd_id"], contenido
+
+
+def test_api_importa_un_avance_al_historial(api, tmp_path, monkeypatch):
+    rfd_id, contenido = _importar_por_api(api, tmp_path, monkeypatch)
+    fila = next(f for f in api.get("/api/rfds").json() if f["id"] == rfd_id)
+    assert fila["origen"] == "en_avance" and fila["codigo"] == "RFD-9" and fila["padre_id"] is None
+    detalle = api.get(f"/api/rfds/{rfd_id}").json()
+    assert detalle["archivos"]["docx"] is True and detalle["origen"] == "en_avance"
+    assert api.get(f"/api/rfds/{rfd_id}/archivo/docx").content == contenido
+
+
+def test_api_importar_valida_la_entrada(api, tmp_path):
+    from docx import Document
+
+    valido = _docx_con_texto(tmp_path / "ok.docx", "Capítulo 1").read_bytes()
+    vacio = tmp_path / "vacio.docx"
+    Document().save(vacio)
+    datos = {"cliente": "Cliente X", "codigo": "RFD-9"}
+
+    def importar(nombre, contenido, **cambios):
+        return api.post("/api/rfds/importar", files=[("archivo", (nombre, contenido))], data={**datos, **cambios})
+
+    assert "Sólo se admite" in importar("avance.pdf", b"%PDF").json()["detail"]
+    assert "No se pudo leer" in importar("roto.docx", b"no es zip").json()["detail"]
+    assert "no contiene texto" in importar("vacio.docx", vacio.read_bytes()).json()["detail"]
+    assert importar("ok.docx", valido, codigo="  ").status_code == 400
+    assert importar("ok.docx", valido, cliente=" ").status_code == 400
+    assert api.get("/api/rfds").json() == []
+
+
+def test_api_continua_un_rfd_importado_sin_respuestas(api, tmp_path, monkeypatch):
+    from generador_rfd import pipeline
+
+    rfd_id, _ = _importar_por_api(api, tmp_path, monkeypatch)
+    recibido: dict = {}
+
+    def continuar_falso(*, datos, contexto, instruccion, **_):
+        recibido.update(contexto=[f.nombre for f in contexto], instruccion=instruccion)
+        nuevo = _sin_version(datos)
+        nuevo["cambios"] = [{"pregunta": "Continuación", "seccion": "1.3 Alcance", "cambio": "Se completa."}]
+        return nuevo
+
+    monkeypatch.setattr(pipeline, "continuar_rfd", continuar_falso)
+    monkeypatch.setattr(pipeline, "asegurar_calidad", _calidad_falsa())
+    assert api.post("/api/rfds/999/continuar", data={"proveedor": "claude"}).status_code == 404
+    r = api.post(f"/api/rfds/{rfd_id}/continuar", files=[("adjuntos", ("acta.txt", b"Acta de la reunion"))],
+                 data={"instruccion": "Enfócate en RF-02", "proveedor": "claude", "modelo": "haiku", "revisar_word": "false"})
+    assert r.status_code == 200, r.text
+    t = _esperar(api, r.json()["id"])
+    assert t["estado"] == "listo", t.get("error")
+    assert recibido == {"contexto": ["acta.txt"], "instruccion": "Enfócate en RF-02"}
+    nuevo = api.get(f"/api/rfds/{t['resultado']['rfd_id']}").json()
+    assert nuevo["padre_id"] == rfd_id and nuevo["origen"] == "continuado" and nuevo["version"] == "0.2"
+    assert api.get(f"/api/rfds/{rfd_id}").json()["version"] == "0.1"
+    assert next(f for f in api.get("/api/rfds").json() if f["id"] == rfd_id)["mejorado"] is True
+
+
+def test_continuar_un_importado_no_pisa_al_rfd_generado_ni_hereda_su_analisis(api, tmp_path, monkeypatch):
+    from generador_rfd import pipeline
+
+    rfd_id, _ = _importar_por_api(api, tmp_path, monkeypatch)
+    ajeno = servidor.SALIDAS / "RFD_RFD-9.analisis.json"  # análisis de otro RFD con el mismo código
+    ajeno.write_text(json.dumps({"F01": {"resumen": "de otro RFD"}}), encoding="utf-8")
+    recibido: dict = {}
+    calidad_falsa = _calidad_falsa()
+
+    def calidad_espia(nuevo, o, analisis, *a, **k):
+        recibido["analisis"] = analisis
+        return calidad_falsa(nuevo, o, analisis, *a, **k)
+
+    monkeypatch.setattr(pipeline, "continuar_rfd", lambda *, datos, **_: _sin_version(datos))
+    monkeypatch.setattr(pipeline, "asegurar_calidad", calidad_espia)
+    r = api.post(f"/api/rfds/{rfd_id}/continuar", data={"proveedor": "claude", "modelo": "haiku", "revisar_word": "false"})
+    t = _esperar(api, r.json()["id"])
+    assert t["estado"] == "listo", t.get("error")
+    nuevo = servidor.almacen().obtener(t["resultado"]["rfd_id"])
+    assert Path(nuevo["ruta_docx"]).name == "RFD_RFD-9_importado_v0.2.docx"
+    assert recibido["analisis"] is None
+    assert not (servidor.SALIDAS / "RFD_RFD-9_importado_v0.2.analisis.json").exists()
+    assert ajeno.is_file()
+
+
+def test_api_importar_con_nombre_peligroso_no_deja_trabajos_huerfanos(api):
+    antes = dict(servidor._trabajos)
+    r = api.post("/api/rfds/importar", files=[("archivo", ("..", b"x"))], data={"cliente": "Cliente X", "codigo": "RFD-9"})
+    assert r.status_code == 400
+    assert servidor._trabajos == antes
+
+
+def test_cli_importa_y_continua(api, tmp_path, monkeypatch):
+    from generador_rfd import cli, pipeline
+
+    a = cli.parser().parse_args(["importar", "avance.docx", "--cliente", "C", "--codigo", "K"])
+    assert a.comando == "importar" and a.archivo == Path("avance.docx") and a.titulo is None
+    b = cli.parser().parse_args(["continuar", "--id", "3", "--contexto", "a.txt", "--instruccion", "foco"])
+    assert (b.comando, b.id, b.contexto, b.instruccion) == ("continuar", 3, [Path("a.txt")], "foco")
+
+    original = _docx_con_texto(tmp_path / "avance.docx", "(K-1)", "2.1 Registro")
+    monkeypatch.setattr(pipeline, "reconstruir_rfd", lambda **k: _demo_normalizado())
+    monkeypatch.setattr(pipeline, "continuar_rfd", lambda *, datos, **_: _sin_version(datos))
+    monkeypatch.setattr(pipeline, "asegurar_calidad", _calidad_falsa())
+    assert cli.main(["importar", str(original), "--cliente", "Cliente X", "--codigo", "K-1"]) == 0
+    assert cli.main(["importar", str(tmp_path / "no_existe.docx"), "--cliente", "C", "--codigo", "K"]) == 2
+    (importado,) = servidor.almacen().listar()
+    assert importado["origen"] == "en_avance"
+    assert cli.main(["continuar", "--id", str(importado["id"]), "--sin-word"]) == 0
+    versiones = {f["version"]: f for f in servidor.almacen().listar()}
+    assert versiones["0.2"]["origen"] == "continuado" and versiones["0.2"]["padre_id"] == importado["id"]
+
+
+# ---------------------------------------------------------------- Prototipo desde el proyecto original
+
+def _proyecto_web(tmp_path, **extra) -> Path:
+    raiz = tmp_path / "proyecto"
+    raiz.mkdir()
+    (raiz / "package.json").write_text(json.dumps({"scripts": {"dev": "vite", "build": "vite build", "start": "node s.js"}}), encoding="utf-8")
+    for nombre, contenido in extra.items():
+        destino = raiz / nombre
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        destino.write_text(contenido, encoding="utf-8")
+    return raiz
+
+
+def test_detecta_comandos_sin_ejecutar_nada(tmp_path, monkeypatch):
+    from generador_rfd import prototipo
+
+    monkeypatch.setattr(prototipo.shutil, "which", lambda nombre: None)
+    ejecutado = []
+    monkeypatch.setattr(prototipo.subprocess, "Popen", lambda *a, **k: ejecutado.append(a))
+    monkeypatch.setattr(prototipo.subprocess, "run", lambda *a, **k: ejecutado.append(a))
+    raiz = _proyecto_web(tmp_path, **{"bun.lock": "", "Makefile": "dev:\n\tbun run dev\nbuild:\n\techo\nrun: dev\n",
+                                       "manage.py": "", "index.html": "<html></html>"})
+    comandos = prototipo.detectar_comandos(raiz)
+    por_etiqueta = {c["etiqueta"]: c for c in comandos}
+    assert por_etiqueta["bun run dev"]["comando"] == ["bun", "run", "dev"]
+    assert por_etiqueta["bun run dev"]["url_esperada"] == "http://localhost:5173"
+    assert por_etiqueta["bun run dev"]["cwd"] == str(raiz)
+    assert "bun run start" in por_etiqueta and "bun run build" not in por_etiqueta
+    assert por_etiqueta["make dev"]["comando"] == ["make", "dev"] and "make run" in por_etiqueta
+    assert por_etiqueta["python manage.py runserver"]["url_esperada"] == "http://127.0.0.1:8000"
+    estatico = next(c for c in comandos if "http.server" in c["etiqueta"])
+    assert estatico["comando"][1:4] == ["-m", "http.server", estatico["comando"][3]] and estatico["url_esperada"].startswith("http://127.0.0.1:")
+    assert ejecutado == []
+
+
+@pytest.mark.parametrize("candado,esperado", [("pnpm-lock.yaml", ["pnpm", "run"]), ("yarn.lock", ["yarn"]), ("", ["npm", "run"])])
+def test_el_gestor_de_paquetes_sale_del_lockfile(tmp_path, monkeypatch, candado, esperado):
+    from generador_rfd import prototipo
+
+    monkeypatch.setattr(prototipo.shutil, "which", lambda nombre: None)
+    raiz = _proyecto_web(tmp_path, **({candado: ""} if candado else {}))
+    assert next(c for c in prototipo.detectar_comandos(raiz) if c["etiqueta"].endswith(" dev"))["comando"][:len(esperado)] == esperado
+
+
+def test_resuelve_el_shim_cmd_de_windows(tmp_path, monkeypatch):
+    from generador_rfd import prototipo
+
+    monkeypatch.setattr(prototipo.shutil, "which", lambda nombre: r"C:\bun\bun.CMD" if nombre == "bun" else None)
+    raiz = _proyecto_web(tmp_path, **{"bun.lock": ""})
+    c = next(c for c in prototipo.detectar_comandos(raiz) if c["etiqueta"] == "bun run dev")
+    assert c["comando"][0] == r"C:\bun\bun.CMD"
+
+
+def test_detecta_en_subcarpetas_y_exige_directorio(tmp_path, monkeypatch):
+    from generador_rfd import prototipo
+
+    monkeypatch.setattr(prototipo.shutil, "which", lambda nombre: None)
+    raiz = tmp_path / "varios"
+    (raiz / "web").mkdir(parents=True)
+    (raiz / "web" / "package.json").write_text(json.dumps({"scripts": {"dev": "next dev"}}), encoding="utf-8")
+    (raiz / "node_modules" / "x").mkdir(parents=True)
+    (raiz / "node_modules" / "x" / "package.json").write_text(json.dumps({"scripts": {"dev": "x"}}), encoding="utf-8")
+    (c,) = prototipo.detectar_comandos(raiz)
+    assert c["cwd"] == str(raiz / "web") and c["url_esperada"] == "http://localhost:3000"
+    with pytest.raises(ValueError, match="carpeta"):
+        prototipo.detectar_comandos(tmp_path / "no_existe")
+
+
+def test_diseno_estatico_junta_el_css_real_y_omite_dependencias(tmp_path):
+    from generador_rfd import prototipo
+
+    raiz = _proyecto_web(tmp_path, **{
+        "src/styles.css": ":root { --primario: #123456; }\nbody { font-family: Inter; }",
+        "src/app.min.css": "x{}", "tailwind.config.js": "module.exports = { theme: { colors: { marca: '#ff0000' } } }",
+        "node_modules/lib/estilo.css": "a{color:red}", "dist/salida.css": "a{color:blue}",
+        "src/enorme.css": "a{color:green}\n" * 50_000,
+    })
+    texto = prototipo.diseno_estatico(raiz)
+    assert "--primario: #123456" in texto and "marca: '#ff0000'" in texto
+    assert "node_modules" not in texto and "salida.css" not in texto and "app.min.css" not in texto
+    assert len(texto) < prototipo.MAX_DISENO + 2_000
+    assert texto.index("tailwind.config.js") < texto.index("styles.css"), "primero la configuración de tokens"
+    assert prototipo.diseno_estatico(tmp_path / "vacio") == ""
+
+
+class _ProcesoFalso:
+    """Sustituye a subprocess.Popen: nunca se inicia un proceso real."""
+
+    creados: list = []
+
+    def __init__(self, comando, salida: str = "", codigo=None, **opciones):
+        import io
+
+        self.comando, self.opciones, self.pid, self._codigo = comando, opciones, 4321, codigo
+        self.stdout = io.StringIO(salida)
+        _ProcesoFalso.creados.append(self)
+
+    def poll(self):
+        return self._codigo
+
+    def terminate(self):
+        self._codigo = -15
+
+    kill = terminate
+
+    def wait(self, timeout=None):
+        return self._codigo
+
+
+def _falso(monkeypatch, salida="", codigo=None):
+    from generador_rfd import prototipo
+
+    _ProcesoFalso.creados = []
+    monkeypatch.setattr(prototipo.subprocess, "Popen", lambda comando, **o: _ProcesoFalso(comando, salida, codigo, **o))
+    monkeypatch.setattr(prototipo, "_puerto_abierto", lambda host, puerto: False)
+    return prototipo.Gestor()
+
+
+def _hasta(condicion, limite=5.0):
+    fin = time.time() + limite
+    while not condicion():
+        assert time.time() < fin, "la condición no se cumplió"
+        time.sleep(0.01)
+
+
+def test_levanta_sin_shell_y_detecta_la_url_de_la_salida(monkeypatch, tmp_path):
+    gestor = _falso(monkeypatch, "\x1b[32m  VITE ready\x1b[0m\n  \x1b[1mLocal\x1b[0m: http://localhost:5173/\n")
+    e = gestor.levantar("p1", ["bun", "run", "dev"], tmp_path)
+    assert e["estado"] in ("iniciando", "activo")
+    _hasta(lambda: gestor.estado("p1")["estado"] == "activo")
+    e = gestor.estado("p1")
+    (p,) = _ProcesoFalso.creados
+    assert p.comando == ["bun", "run", "dev"] and not p.opciones.get("shell") and p.opciones["cwd"] == str(tmp_path)
+    assert e["url"] == "http://localhost:5173" and "VITE ready" in "\n".join(e["log"]) and "\x1b" not in "\n".join(e["log"])
+
+
+def test_sin_url_en_la_salida_prueba_el_puerto_esperado(monkeypatch, tmp_path):
+    from generador_rfd import prototipo
+
+    gestor = _falso(monkeypatch, "Serving HTTP on :: port 8765 (http://[::]:8765/)\n")
+    gestor.levantar("p1", ["python", "-m", "http.server", "8765"], tmp_path, "http://127.0.0.1:8765")
+    _hasta(lambda: gestor._procesos["p1"].lector_terminado)
+    assert gestor.estado("p1")["estado"] == "iniciando"
+    monkeypatch.setattr(prototipo, "_puerto_abierto", lambda host, puerto: (host, puerto) == ("127.0.0.1", 8765))
+    e = gestor.estado("p1")
+    assert e["estado"] == "activo" and e["url"] == "http://127.0.0.1:8765"
+
+
+def test_el_log_esta_acotado(monkeypatch, tmp_path):
+    from generador_rfd import prototipo
+
+    gestor = _falso(monkeypatch, "".join(f"linea {i}\n" for i in range(prototipo.MAX_LINEAS_LOG + 50)))
+    gestor.levantar("p1", ["x"], tmp_path)
+    _hasta(lambda: gestor._procesos["p1"].lector_terminado)
+    log = gestor.estado("p1")["log"]
+    assert len(log) == prototipo.MAX_LINEAS_LOG and log[-1] == f"linea {prototipo.MAX_LINEAS_LOG + 49}"
+
+
+def test_un_proceso_que_termina_queda_en_error_o_detenido(monkeypatch, tmp_path):
+    gestor = _falso(monkeypatch, "Error: puerto ocupado\n", codigo=1)
+    gestor.levantar("fallo", ["x"], tmp_path)
+    _hasta(lambda: gestor._procesos["fallo"].lector_terminado)
+    e = gestor.estado("fallo")
+    assert e["estado"] == "error" and e["codigo"] == 1 and "puerto ocupado" in e["log"][-1]
+    ok = _falso(monkeypatch, "", codigo=0)
+    ok.levantar("fin", ["x"], tmp_path)
+    assert ok.estado("fin")["estado"] == "detenido"
+    assert ok.estado("nunca")["estado"] == "detenido"
+
+
+def test_un_solo_proceso_por_prototipo_y_errores_claros(monkeypatch, tmp_path):
+    from generador_rfd import prototipo
+
+    gestor = _falso(monkeypatch)
+    gestor.levantar("p1", ["x"], tmp_path)
+    with pytest.raises(RuntimeError, match="Ya hay un proceso"):
+        gestor.levantar("p1", ["y"], tmp_path)
+    with pytest.raises(ValueError, match="comando"):
+        gestor.levantar("p2", [], tmp_path)
+
+    def sin_ejecutable(*a, **k):
+        raise FileNotFoundError("no existe")
+
+    monkeypatch.setattr(prototipo.subprocess, "Popen", sin_ejecutable)
+    with pytest.raises(RuntimeError, match="No se pudo iniciar"):
+        gestor.levantar("p3", ["inexistente"], tmp_path)
+    assert gestor.estado("p3")["estado"] == "detenido"
+
+
+@pytest.mark.parametrize("windows", [True, False])
+def test_detener_mata_todo_el_arbol_de_procesos(monkeypatch, tmp_path, windows):
+    from generador_rfd import prototipo
+
+    gestor = _falso(monkeypatch)
+    monkeypatch.setattr(prototipo, "WINDOWS", windows)
+    llamadas = []
+    monkeypatch.setattr(prototipo.subprocess, "run", lambda comando, **k: llamadas.append(("run", comando)))
+    monkeypatch.setattr(prototipo.os, "killpg", lambda pgid, senal: llamadas.append(("killpg", pgid)), raising=False)
+    monkeypatch.setattr(prototipo.os, "getpgid", lambda pid: pid, raising=False)
+    gestor.levantar("p1", ["x"], tmp_path)
+    assert gestor.detener("p1")["estado"] == "detenido"
+    assert llamadas[0] == (("run", ["taskkill", "/PID", "4321", "/T", "/F"]) if windows else ("killpg", 4321))
+    assert gestor.estado("p1")["estado"] == "detenido"
+    gestor.levantar("p1", ["x"], tmp_path)  # tras detenerlo puede volver a levantarse
+
+
+def test_detener_todos_y_url_ya_corriendo(monkeypatch, tmp_path):
+    from generador_rfd import prototipo
+
+    gestor = _falso(monkeypatch)
+    monkeypatch.setattr(prototipo.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(prototipo.os, "killpg", lambda *a: None, raising=False)
+    monkeypatch.setattr(prototipo.os, "getpgid", lambda pid: pid, raising=False)
+    gestor.levantar("a", ["x"], tmp_path)
+    gestor.levantar("b", ["x"], tmp_path)
+    gestor.adoptar_url("c", "http://localhost:3000/")
+    assert gestor.estado("c") == {**gestor.estado("c"), "estado": "activo", "url": "http://localhost:3000", "externo": True}
+    with pytest.raises(ValueError, match="URL"):
+        gestor.adoptar_url("d", "ftp://x")
+    gestor.detener_todos()
+    assert all(gestor.estado(i)["estado"] == "detenido" for i in "abc")
+
+
+class _PaginaFalsa:
+    def __init__(self, visitadas):
+        self.visitadas = visitadas
+
+    def goto(self, url, **k):
+        self.visitadas.append(url)
+        self.url = url
+
+    def wait_for_timeout(self, ms):
+        pass
+
+    def screenshot(self, path, full_page):
+        assert full_page is True
+        Path(path).write_bytes(b"\x89PNG-falso")
+
+    def evaluate(self, js):
+        return {"html": "<html>" + "x" * 300_000 + "</html>", "css": f".a{{color:red}} /* {self.url} */",
+                "diseno": {"fuentes": ["Inter"], "texto": "rgb(0, 0, 0)", "fondo": "rgb(255, 255, 255)", "acento": "rgb(1, 2, 3)",
+                           "variables": {"--primario": "#123456"}}}
+
+
+def _playwright_falso(monkeypatch, fallan=()):
+    from contextlib import contextmanager
+
+    from generador_rfd import prototipo
+
+    visitadas, canales = [], []
+
+    class Chromium:
+        def launch(self, channel=None, **k):
+            canales.append(channel)
+            if channel in fallan:
+                raise RuntimeError(f"{channel} no está instalado")
+            return type("N", (), {"new_page": lambda s, **k: _PaginaFalsa(visitadas), "close": lambda s: None})()
+
+    @contextmanager
+    def sync_playwright():
+        yield type("P", (), {"chromium": Chromium()})()
+
+    monkeypatch.setattr(prototipo, "_sync_playwright", lambda: sync_playwright)
+    return visitadas, canales
+
+
+def test_captura_pantallas_css_y_resumen_de_diseno(monkeypatch, tmp_path):
+    from generador_rfd import prototipo
+
+    visitadas, canales = _playwright_falso(monkeypatch)
+    destino = tmp_path / "captura"
+    r = prototipo.capturar("http://localhost:5173/", ["/", "ordenes/nueva"], destino)
+    assert visitadas == ["http://localhost:5173/", "http://localhost:5173/ordenes/nueva"] and canales == ["chrome"]
+    assert [x["ruta"] for x in r] == ["/", "/ordenes/nueva"]
+    assert (destino / "pantalla_1.png").read_bytes().startswith(b"\x89PNG")
+    assert (destino / "pantalla_2.html").stat().st_size <= prototipo.MAX_HTML_PANTALLA + 100
+    css = (destino / "estilos.css").read_text(encoding="utf-8")
+    assert "localhost:5173/ */" in css and "ordenes/nueva" in css
+    diseno = json.loads((destino / "diseno.json").read_text(encoding="utf-8"))
+    assert diseno["variables"]["--primario"] == "#123456" and diseno["fuentes"] == ["Inter"]
+    assert prototipo.pantallas_capturadas(destino) == r
+    contexto = prototipo.contexto_captura(destino)
+    assert "--primario" in contexto and "color:red" in contexto and "<html>" in contexto
+
+
+def test_captura_cae_a_edge_y_explica_cuando_no_hay_navegador(monkeypatch, tmp_path):
+    from generador_rfd import prototipo
+
+    _, canales = _playwright_falso(monkeypatch, fallan=("chrome",))
+    prototipo.capturar("http://localhost:3000", ["/"], tmp_path / "a")
+    assert canales == ["chrome", "msedge"]
+    _playwright_falso(monkeypatch, fallan=("chrome", "msedge"))
+    with pytest.raises(RuntimeError, match="Chrome o Edge"):
+        prototipo.capturar("http://localhost:3000", ["/"], tmp_path / "b")
+
+
+def test_captura_sin_playwright_indica_como_instalarlo(monkeypatch, tmp_path):
+    import builtins
+
+    from generador_rfd import prototipo
+
+    real = builtins.__import__
+
+    def sin_playwright(nombre, *a, **k):
+        if nombre.startswith("playwright"):
+            raise ImportError(nombre)
+        return real(nombre, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", sin_playwright)
+    with pytest.raises(RuntimeError, match=r"pip install -e \"\.\[prototipo\]\""):
+        prototipo.capturar("http://localhost:3000", ["/"], tmp_path / "c")
+
+
+def test_captura_valida_la_url(monkeypatch, tmp_path):
+    from generador_rfd import prototipo
+
+    visitadas, _ = _playwright_falso(monkeypatch)
+    for mala in ("file:///c:/secreto", "javascript:alert(1)", ""):
+        with pytest.raises(ValueError, match="URL"):
+            prototipo.capturar(mala, ["/"], tmp_path / "d")
+    prototipo.capturar("http://localhost:3000", ["//otro.com/x", "/ok"], tmp_path / "d")
+    assert visitadas == ["http://localhost:3000/otro.com/x", "http://localhost:3000/ok"]
+
+
+def _html_proto(texto="Nueva pantalla"):
+    return f'<!doctype html><html><head><style>.btn{{color:#123456}}</style></head><body><button class="btn">{texto}</button></body></html>'
+
+
+def _modelo_falso(monkeypatch, respuestas):
+    """Sustituye invocar(): devuelve las respuestas en orden y registra los prompts recibidos."""
+    from generador_rfd import prototipo
+
+    prompts = []
+
+    def invocar_falso(*, proveedor, modelo, prompt, esquema, directorio, **k):
+        prompts.append({"prompt": prompt, "esquema": esquema, "proveedor": proveedor, "modelo": modelo})
+        return respuestas.pop(0)
+
+    monkeypatch.setattr(prototipo, "invocar", invocar_falso)
+    return prompts
+
+
+def _nuevo_proto(tmp_path, rfd_id=None, **css):
+    from generador_rfd import prototipo
+
+    proyecto = _proyecto_web(tmp_path, **{"src/estilos.css": ":root{--marca:#abcdef}", **css})
+    raiz = tmp_path / "prototipos"
+    return prototipo.crear_prototipo(raiz, proyecto, rfd_id), raiz, proyecto
+
+
+def test_turno_genera_la_primera_version_con_las_reglas_del_prompt(monkeypatch, tmp_path):
+    from generador_rfd import prototipo
+
+    id_, raiz, proyecto = _nuevo_proto(tmp_path)
+    prompts = _modelo_falso(monkeypatch, [{"html": _html_proto(), "resumen": "Pantalla de ejemplo; falta el logotipo."}])
+    datos_rfd = {"titulo": "Registro de órdenes", "objetivo": "Permitir registrar órdenes.", "requerimientos": [
+        {"id": "RF-01", "nombre": "Registrar orden", "parrafos": ["El usuario registra."], "elementos": [{"titulo": "Campo cliente", "detalle": "x"}],
+         "flujo": [{"numero": 1, "actor": "Usuario", "componente": "Formulario", "accion": "Completa los datos"}], "criterios_aceptacion": ["Se guarda"]}]}
+    r = prototipo.turno(raiz / id_, "Muestra el formulario de registro", proveedor="claude", modelo="haiku", directorio=tmp_path, rfd=datos_rfd)
+    assert r["version"] == 1 and "logotipo" in r["resumen"]
+    (p,) = prompts
+    assert p["esquema"]["required"] == ["html", "resumen"] and p["modelo"] == "haiku"
+    for frase in ("autocontenido", "REUTILIZA", "--marca:#abcdef", "Nuevo", "Modificado", "sin CDN", "No introduzcas un nuevo lenguaje de diseño",
+                  "Registrar orden", "Completa los datos", "Muestra el formulario de registro", "marcadores de posición"):
+        assert frase in p["prompt"], frase
+    assert "Prototipo actual" not in p["prompt"]
+    assert (raiz / id_ / "v1.html").read_text(encoding="utf-8") == _html_proto()
+    chat = prototipo.leer_chat(raiz / id_)
+    assert [m["rol"] for m in chat] == ["usuario", "ia"] and chat[1]["version"] == 1 and chat[0]["texto"].startswith("Muestra")
+    assert chat[0]["cuando"] and prototipo.versiones(raiz / id_) == [1]
+
+
+def test_turno_itera_sobre_la_version_anterior_y_conserva_las_previas(monkeypatch, tmp_path):
+    from generador_rfd import prototipo
+
+    id_, raiz, _ = _nuevo_proto(tmp_path)
+    prompts = _modelo_falso(monkeypatch, [{"html": _html_proto("Uno"), "resumen": "Primera."}, {"html": _html_proto("Dos"), "resumen": "Segunda."}])
+    prototipo.turno(raiz / id_, "Primera pantalla", proveedor="claude", modelo="", directorio=tmp_path)
+    r = prototipo.turno(raiz / id_, "Cambia el botón", proveedor="claude", modelo="", directorio=tmp_path)
+    assert r["version"] == 2 and "Uno" in prompts[1]["prompt"] and "Prototipo actual" in prompts[1]["prompt"]
+    assert "Primera pantalla" in prompts[1]["prompt"], "la conversación previa viaja en el prompt"
+    assert "Uno" in (raiz / id_ / "v1.html").read_text(encoding="utf-8") and "Dos" in (raiz / id_ / "v2.html").read_text(encoding="utf-8")
+    assert prototipo.versiones(raiz / id_) == [1, 2] and len(prototipo.leer_chat(raiz / id_)) == 4
+
+
+def test_turno_usa_la_captura_si_existe_y_si_no_el_diseno_estatico(monkeypatch, tmp_path):
+    from generador_rfd import prototipo
+
+    id_, raiz, _ = _nuevo_proto(tmp_path)
+    prompts = _modelo_falso(monkeypatch, [{"html": _html_proto(), "resumen": "a"}, {"html": _html_proto(), "resumen": "b"}])
+    prototipo.turno(raiz / id_, "uno", proveedor="claude", modelo="", directorio=tmp_path)
+    assert "--marca:#abcdef" in prompts[0]["prompt"] and "CSS completo del proyecto" not in prompts[0]["prompt"]
+    _playwright_falso(monkeypatch)
+    prototipo.capturar("http://localhost:5173", ["/"], raiz / id_ / "captura")
+    prototipo.turno(raiz / id_, "dos", proveedor="claude", modelo="", directorio=tmp_path)
+    assert "CSS completo del proyecto" in prompts[1]["prompt"] and "--primario" in prompts[1]["prompt"]
+
+
+def test_turno_rechaza_respuestas_invalidas_y_avisa_de_recursos_externos(monkeypatch, tmp_path):
+    from generador_rfd import prototipo
+
+    id_, raiz, _ = _nuevo_proto(tmp_path)
+    externo = '<!doctype html><html><head><link rel="stylesheet" href="https://cdn.ejemplo.com/x.css"></head><body><a href="https://ok.com">enlace</a></body></html>'
+    _modelo_falso(monkeypatch, [{"html": "no es html", "resumen": "x"}, {"html": "", "resumen": "x"}, {"html": externo, "resumen": "Con estilos."}])
+    for _ in range(2):
+        with pytest.raises(ValueError, match="HTML"):
+            prototipo.turno(raiz / id_, "m", proveedor="claude", modelo="", directorio=tmp_path)
+    assert prototipo.leer_chat(raiz / id_) == [] and prototipo.versiones(raiz / id_) == []
+    r = prototipo.turno(raiz / id_, "m", proveedor="claude", modelo="", directorio=tmp_path)
+    assert "cdn.ejemplo.com" in r["resumen"] and "ok.com" not in r["resumen"] and r["resumen"].startswith("Con estilos.")
+
+
+def test_crear_prototipo_valida_la_ruta_y_los_ids(tmp_path):
+    from generador_rfd import prototipo
+
+    with pytest.raises(ValueError, match="carpeta"):
+        prototipo.crear_prototipo(tmp_path / "p", tmp_path / "no_existe")
+    id_ = prototipo.crear_prototipo(tmp_path / "p", tmp_path, 7)
+    assert prototipo.leer_meta(tmp_path / "p" / id_)["rfd_id"] == 7
+    assert prototipo.carpeta_de(tmp_path / "p", id_) == tmp_path / "p" / id_
+    for malo in ("../x", "..", "a/b", "a" * 80, "no_existe_ok"):
+        with pytest.raises(KeyError):
+            prototipo.carpeta_de(tmp_path / "p", malo)
+
+
+@pytest.fixture
+def proto(api, tmp_path, monkeypatch):
+    """API con un gestor de procesos y un Playwright falsos: ningún test inicia procesos ni navegadores."""
+    from generador_rfd import prototipo
+
+    gestor = _falso(monkeypatch)
+    monkeypatch.setattr(prototipo, "GESTOR", gestor)
+    monkeypatch.setattr(prototipo.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(prototipo.os, "killpg", lambda *a: None, raising=False)
+    monkeypatch.setattr(prototipo.os, "getpgid", lambda pid: pid, raising=False)
+    monkeypatch.setattr(prototipo.shutil, "which", lambda nombre: None)
+    monkeypatch.setattr(prototipo, "capturar_pantallas_html", lambda html: [])
+    api.proyecto = _proyecto_web(tmp_path, **{"src/estilos.css": ":root{--marca:#abcdef}"})
+    api.gestor = gestor
+    return api
+
+
+def _crear_proto(cliente, rfd_id=None) -> str:
+    r = cliente.post("/api/prototipos", json={"ruta": str(cliente.proyecto), "rfd_id": rfd_id})
+    assert r.status_code == 200, r.text
+    return r.json()["id"]
+
+
+def test_api_detecta_comandos_y_valida_la_ruta(proto):
+    r = proto.get("/api/prototipos/detectar", params={"ruta": str(proto.proyecto)})
+    assert r.status_code == 200 and r.json()["comandos"][0]["comando"] == ["npm", "run", "dev"]
+    assert proto.get("/api/prototipos/detectar", params={"ruta": str(proto.proyecto / "nada")}).status_code == 400
+    assert proto.post("/api/prototipos", json={"ruta": str(proto.proyecto / "nada")}).status_code == 400
+    assert proto.post("/api/prototipos", json={"ruta": str(proto.proyecto), "rfd_id": 999}).status_code == 404
+
+
+def test_api_crea_y_consulta_un_prototipo(proto):
+    id_ = _crear_proto(proto)
+    d = proto.get(f"/api/prototipos/{id_}").json()
+    assert d["ruta"] == str(proto.proyecto.resolve()) and d["rfd"] is None and d["chat"] == [] and d["versiones"] == []
+    assert d["proceso"]["estado"] == "detenido" and d["captura"]["pantallas"] == []
+    (fila,) = proto.get("/api/prototipos").json()
+    assert fila["id"] == id_ and fila["ruta"] == d["ruta"] and fila["versiones"] == 0 and fila["rfd"] is None
+    for malo in ("0000000000", "zzzz", "..%2F..%2Fx"):
+        assert proto.get(f"/api/prototipos/{malo}").status_code == 404
+
+
+def test_api_levanta_detiene_y_exige_un_comando_valido(proto):
+    id_ = _crear_proto(proto)
+    r = proto.post(f"/api/prototipos/{id_}/levantar", json={"comando": ["npm", "run", "dev"], "url_esperada": "http://localhost:5173"})
+    assert r.status_code == 200, r.text
+    (p,) = _ProcesoFalso.creados
+    assert p.comando == ["npm", "run", "dev"] and p.opciones["cwd"] == str(proto.proyecto.resolve())
+    assert proto.post(f"/api/prototipos/{id_}/levantar", json={"comando": ["npm", "start"]}).status_code == 409
+    assert proto.post(f"/api/prototipos/{id_}/detener").json()["estado"] == "detenido"
+    otro = proto.proyecto.parent
+    assert proto.post(f"/api/prototipos/{id_}/levantar", json={"comando": ["x"], "cwd": str(otro)}).status_code == 400
+    assert proto.post(f"/api/prototipos/{id_}/levantar", json={"comando": []}).status_code == 400
+    assert proto.post(f"/api/prototipos/{id_}/levantar", json={}).status_code == 400
+    # «Ya está corriendo»: sólo se recuerda la URL, sin iniciar nada.
+    antes = len(_ProcesoFalso.creados)
+    d = proto.post(f"/api/prototipos/{id_}/levantar", json={"url": "http://localhost:3000/"}).json()
+    assert d["estado"] == "activo" and d["url"] == "http://localhost:3000" and len(_ProcesoFalso.creados) == antes
+    assert proto.post(f"/api/prototipos/{id_}/levantar", json={"url": "ftp://x"}).status_code == 400
+
+
+def test_api_captura_en_segundo_plano_y_sirve_solo_su_carpeta(proto, monkeypatch):
+    id_ = _crear_proto(proto)
+    assert proto.post(f"/api/prototipos/{id_}/capturar", json={"rutas": ["/"]}).status_code == 409, "sin proyecto en ejecución ni URL"
+    _playwright_falso(monkeypatch)
+    proto.post(f"/api/prototipos/{id_}/levantar", json={"url": "http://localhost:5173"})
+    r = proto.post(f"/api/prototipos/{id_}/capturar", json={"rutas": ["/", "/ordenes"]})
+    assert r.status_code == 200, r.text
+    t = _esperar(proto, r.json()["id"])
+    assert t["estado"] == "listo", t.get("error")
+    assert [x["ruta"] for x in t["resultado"]["pantallas"]] == ["/", "/ordenes"]
+    d = proto.get(f"/api/prototipos/{id_}").json()
+    assert [x["imagen"] for x in d["captura"]["pantallas"]] == ["pantalla_1.png", "pantalla_2.png"]
+    png = proto.get(f"/api/prototipos/{id_}/captura/pantalla_1.png")
+    assert png.status_code == 200 and png.content.startswith(b"\x89PNG") and png.headers["content-type"] == "image/png"
+    html = proto.get(f"/api/prototipos/{id_}/captura/pantalla_1.html")
+    assert html.headers["content-type"].startswith("text/plain")
+    for malo in ("..%2Fmeta.json", "..%5Cmeta.json", "inexistente.png", "%2e%2e%2fmeta.json", "meta.json"):
+        assert proto.get(f"/api/prototipos/{id_}/captura/{malo}").status_code == 404
+    assert proto.get(f"/api/prototipos/{id_}/captura/captura.json").status_code == 200
+
+
+def test_api_captura_sin_playwright_falla_con_un_mensaje_claro(proto, monkeypatch):
+    from generador_rfd import prototipo
+
+    def sin_playwright():
+        raise RuntimeError(prototipo.INSTALAR_PLAYWRIGHT)
+
+    monkeypatch.setattr(prototipo, "_sync_playwright", sin_playwright)
+    id_ = _crear_proto(proto)
+    proto.post(f"/api/prototipos/{id_}/levantar", json={"url": "http://localhost:5173"})
+    t = _esperar(proto, proto.post(f"/api/prototipos/{id_}/capturar", json={"rutas": ["/"]}).json()["id"])
+    assert t["estado"] == "error" and 'pip install -e ".[prototipo]"' in t["error"]
+
+
+def test_api_chat_genera_versiones_con_el_rfd_vinculado(proto, tmp_path, monkeypatch):
+    rfd_id, _ = _importar_por_api(proto, tmp_path, monkeypatch)
+    id_ = _crear_proto(proto, rfd_id)
+    prompts = _modelo_falso(monkeypatch, [{"html": _html_proto("Uno"), "resumen": "Primera."}, {"html": _html_proto("Dos"), "resumen": "Segunda."}])
+    assert proto.post(f"/api/prototipos/{id_}/mensaje", data={"texto": "  ", "proveedor": "claude"}).status_code == 400
+    r = proto.post(f"/api/prototipos/{id_}/mensaje", data={"texto": "Muestra el registro", "proveedor": "claude", "modelo": "haiku"})
+    assert r.status_code == 200, r.text
+    t = _esperar(proto, r.json()["id"])
+    assert t["estado"] == "listo", t.get("error")
+    assert t["resultado"]["version"] == 1 and t["resultado"]["resumen"] == "Primera." and t["tipo"] == "prototipo"
+    assert prompts[0]["modelo"] == "haiku" and servidor.almacen().obtener(rfd_id)["datos"]["titulo"] in prompts[0]["prompt"]
+    t2 = _esperar(proto, proto.post(f"/api/prototipos/{id_}/mensaje", data={"texto": "Cambia", "proveedor": "claude"}).json()["id"])
+    assert t2["resultado"]["version"] == 2
+    d = proto.get(f"/api/prototipos/{id_}").json()
+    assert d["versiones"] == [1, 2] and [m["rol"] for m in d["chat"]] == ["usuario", "ia", "usuario", "ia"]
+    assert d["rfd"]["id"] == rfd_id and d["rfd"]["codigo"] == "RFD-9"
+    v = proto.get(f"/api/prototipos/{id_}/v/1")
+    assert v.status_code == 200 and "Uno" in v.text and v.headers["content-type"].startswith("text/html")
+    csp = v.headers["content-security-policy"]
+    assert csp.startswith("sandbox allow-scripts") and "default-src 'none'" in csp and "script-src 'unsafe-inline'" in csp
+    assert proto.get(f"/api/prototipos/{id_}/v/9").status_code == 404
+
+
+def test_api_rechaza_un_segundo_trabajo_simultaneo_del_mismo_prototipo(proto):
+    id_ = _crear_proto(proto)
+    servidor._proto_ocupados.add(id_)
+    try:
+        assert proto.post(f"/api/prototipos/{id_}/mensaje", data={"texto": "hola", "proveedor": "claude"}).status_code == 409
+    finally:
+        servidor._proto_ocupados.discard(id_)
+
+
+def test_api_adjunta_el_prototipo_junto_al_word_del_rfd(proto, tmp_path, monkeypatch):
+    rfd_id, _ = _importar_por_api(proto, tmp_path, monkeypatch)
+    _modelo_falso(monkeypatch, [{"html": _html_proto("Uno"), "resumen": "a"}, {"html": _html_proto("Dos"), "resumen": "b"}])
+    id_ = _crear_proto(proto, rfd_id)
+    assert proto.post(f"/api/prototipos/{id_}/adjuntar-rfd", json={}).status_code == 409, "aún no hay versiones"
+    for texto in ("uno", "dos"):
+        _esperar(proto, proto.post(f"/api/prototipos/{id_}/mensaje", data={"texto": texto, "proveedor": "claude"}).json()["id"])
+    assert proto.get(f"/api/rfds/{rfd_id}").json()["archivos"]["prototipo"] is False
+    r = proto.post(f"/api/prototipos/{id_}/adjuntar-rfd", json={"version": 1})
+    assert r.status_code == 200, r.text
+    destino = Path(servidor.almacen().obtener(rfd_id)["ruta_docx"]).parent / "RFD_RFD-9_prototipo.html"
+    assert destino.is_file() and "Uno" in destino.read_text(encoding="utf-8")
+    assert proto.get(f"/api/rfds/{rfd_id}").json()["archivos"]["prototipo"] is True
+    assert "Uno" in proto.get(f"/api/rfds/{rfd_id}/archivo/prototipo").text
+    assert proto.post(f"/api/prototipos/{id_}/adjuntar-rfd", json={"version": 7}).status_code == 404
+    sin_rfd = _crear_proto(proto)
+    assert proto.post(f"/api/prototipos/{sin_rfd}/adjuntar-rfd", json={}).status_code == 400
+
+
+def test_al_cerrar_la_aplicacion_se_detienen_los_procesos(proto):
+    from fastapi.testclient import TestClient
+
+    id_ = _crear_proto(proto)
+    proto.post(f"/api/prototipos/{id_}/levantar", json={"comando": ["npm", "run", "dev"]})
+    assert proto.gestor.estado(id_)["estado"] != "detenido"
+    with TestClient(servidor.app):
+        pass
+    assert proto.gestor.estado(id_)["estado"] == "detenido"
+
+
+def test_un_comando_escrito_como_texto_se_parte_en_argumentos(proto):
+    from generador_rfd import prototipo
+
+    assert prototipo.partir_comando('npm run dev -- --port "5174"') == ["npm", "run", "dev", "--", "--port", "5174"]
+    assert prototipo.partir_comando(r'"C:\Program Files\nodejs\npm.cmd" start') == [r"C:\Program Files\nodejs\npm.cmd", "start"]
+    id_ = _crear_proto(proto)
+    assert proto.post(f"/api/prototipos/{id_}/levantar", json={"comando": "npm run dev"}).status_code == 200
+    assert _ProcesoFalso.creados[-1].comando == ["npm", "run", "dev"]
+
+
+# ---------------------------------------------------------------- Prototipo desde el documento: maquetas del Word
+
+def _png(ancho: int, alto: int, semilla: int = 1) -> bytes:
+    """PNG de ruido (no comprime): sirve para superar el tamaño mínimo de una maqueta."""
+    import random
+    import struct
+    import zlib
+
+    azar = random.Random(semilla)
+    filas = b"".join(b"\x00" + bytes(azar.randrange(256) for _ in range(ancho * 3)) for _ in range(alto))
+
+    def trozo(tipo: bytes, datos: bytes) -> bytes:
+        return struct.pack(">I", len(datos)) + tipo + datos + struct.pack(">I", zlib.crc32(tipo + datos) & 0xFFFFFFFF)
+
+    return (b"\x89PNG\r\n\x1a\n" + trozo(b"IHDR", struct.pack(">IIBBBBB", ancho, alto, 8, 2, 0, 0, 0))
+            + trozo(b"IDAT", zlib.compress(filas)) + trozo(b"IEND", b""))
+
+
+def _docx_con_maquetas(ruta: Path) -> Path:
+    from docx import Document
+
+    imagenes = ruta.parent / "img"
+    imagenes.mkdir(parents=True, exist_ok=True)
+    (imagenes / "ui.png").write_bytes(_png(60, 60, 1))
+    (imagenes / "detalle.png").write_bytes(_png(50, 50, 2))
+    (imagenes / "icono.png").write_bytes(_png(2, 2, 3))
+    documento = Document()
+    documento.sections[0].header.paragraphs[0].add_run().add_picture(str(imagenes / "detalle.png"))  # logo del encabezado
+    documento.add_heading("Consulta de Facturas", level=1)
+    documento.add_heading("Ventana principal", level=2)
+    documento.add_paragraph("La ventana principal estará compuesta por el panel de filtros.")
+    documento.add_picture(str(imagenes / "ui.png"))
+    documento.add_picture(str(imagenes / "icono.png"))         # demasiado pequeña: ícono
+    documento.add_picture(str(imagenes / "ui.png"))            # repetida
+    documento.add_heading("Ventana Detalle", level=2)
+    documento.add_picture(str(imagenes / "detalle.png"))
+    documento.save(ruta)
+    return ruta
+
+
+def test_extrae_solo_las_maquetas_del_cuerpo_con_su_contexto(tmp_path):
+    from generador_rfd.imagenes import extraer_imagenes, leer_indice
+
+    docx = _docx_con_maquetas(tmp_path / "rfd.docx")
+    r = extraer_imagenes(docx, tmp_path / "salida")
+    assert [x["archivo"] for x in r] == ["img_01.png", "img_02.png"]
+    assert r[0]["titulo"] == "Consulta de Facturas › Ventana principal" and "panel de filtros" in r[0]["contexto"]
+    assert r[1]["titulo"] == "Consulta de Facturas › Ventana Detalle" and r[1]["origen"] == "rfd.docx"
+    assert (tmp_path / "salida" / "img_01.png").read_bytes() == _png(60, 60, 1)
+    assert leer_indice(tmp_path / "salida") == r
+    # Un segundo documento suma sus maquetas sin pisar las anteriores ni repetirlas.
+    otro = _docx_con_maquetas(tmp_path / "otro" / "otro.docx")
+    assert extraer_imagenes(otro, tmp_path / "salida") == r
+    assert extraer_imagenes(tmp_path / "salida" / "img_01.png", tmp_path / "x") == []
+
+
+def test_claude_recibe_las_imagenes_como_bloques_de_la_entrada(tmp_path, monkeypatch):
+    import base64
+    from types import SimpleNamespace
+
+    from generador_rfd import modelo
+
+    imagen = tmp_path / "ui.png"
+    imagen.write_bytes(_png(4, 4))
+    llamadas = []
+
+    def run_falso(comando, input, **k):
+        llamadas.append((comando, input))
+        resultado = {"type": "result", "is_error": False, "structured_output": {"ok": "si"}, "usage": {}}
+        salida = json.dumps(resultado) if "stream-json" not in comando else json.dumps({"type": "system"}) + "\n" + json.dumps(resultado)
+        return SimpleNamespace(stdout=salida, stderr="", returncode=0)
+
+    monkeypatch.setattr(modelo.shutil, "which", lambda n: "claude")
+    monkeypatch.setattr(modelo.subprocess, "run", run_falso)
+    esquema = {"type": "object", "properties": {"ok": {"type": "string"}}, "required": ["ok"], "additionalProperties": False}
+    assert modelo.invocar(proveedor="claude", modelo="haiku", prompt="TEXTO", esquema=esquema, directorio=tmp_path, imagenes=[imagen]) == {"ok": "si"}
+    comando, entrada = llamadas[0]
+    assert comando[comando.index("--input-format") + 1] == "stream-json" and "--verbose" in comando
+    contenido = json.loads(entrada)["message"]["content"]
+    assert contenido[0]["source"] == {"type": "base64", "media_type": "image/png", "data": base64.b64encode(imagen.read_bytes()).decode()}
+    assert contenido[-1] == {"type": "text", "text": "TEXTO"}
+    modelo.invocar(proveedor="claude", modelo="haiku", prompt="SOLO", esquema=esquema, directorio=tmp_path)
+    assert "--input-format" not in llamadas[1][0] and llamadas[1][1] == "SOLO"
+
+
+def test_codex_adjunta_las_imagenes_con_su_opcion(tmp_path):
+    from generador_rfd.modelo import comando_codex
+
+    imagen = tmp_path / "ui.png"
+    c = comando_codex("codex", "codex", "", "", tmp_path, tmp_path / "e.json", tmp_path / "r.json", imagenes=[imagen])
+    assert c[c.index("--image") + 1] == str(imagen) and c[-1] == "-"
+    assert "--image" not in comando_codex("codex", "codex", "", "", tmp_path, tmp_path / "e.json", tmp_path / "r.json")
+
+
+def _modelo_falso_con_imagenes(monkeypatch, respuestas):
+    from generador_rfd import prototipo
+
+    recibidos = []
+
+    def invocar_falso(*, prompt, imagenes=None, **k):
+        recibidos.append({"prompt": prompt, "imagenes": list(imagenes or [])})
+        return respuestas.pop(0)
+
+    monkeypatch.setattr(prototipo, "invocar", invocar_falso)
+    return recibidos
+
+
+def test_prototipo_de_documento_no_exige_proyecto_y_usa_las_maquetas(tmp_path, monkeypatch):
+    from generador_rfd import prototipo
+
+    raiz = tmp_path / "prototipos"
+    id_ = prototipo.crear_prototipo(raiz, None, modo="documento")
+    carpeta = raiz / id_
+    assert prototipo.leer_meta(carpeta)["modo"] == "documento" and prototipo.leer_meta(carpeta)["ruta"] == ""
+    agregadas = prototipo.agregar_imagenes(carpeta, _docx_con_maquetas(tmp_path / "rfd.docx"))
+    assert [x["archivo"] for x in agregadas] == ["img_01.png", "img_02.png"] == [x["archivo"] for x in prototipo.imagenes_de(carpeta)]
+    recibidos = _modelo_falso_con_imagenes(monkeypatch, [{"html": _html_proto(), "resumen": "Consulta armada."}])
+    r = prototipo.turno(carpeta, "Arma la consulta", proveedor="claude", modelo="", directorio=tmp_path, imagenes=["img_02.png"])
+    assert r["version"] == 1
+    (p,) = recibidos
+    assert p["imagenes"] == [carpeta / "imagenes" / "img_02.png"]
+    assert "MAQUETAS DEL DOCUMENTO" in p["prompt"] and "Consulta de Facturas › Ventana Detalle" in p["prompt"]
+    assert "Diseño del proyecto ORIGINAL" not in p["prompt"]
+    with pytest.raises(ValueError, match="imagen"):
+        prototipo.turno(carpeta, "otra", proveedor="claude", modelo="", directorio=tmp_path, imagenes=["../meta.json"])
+    with pytest.raises(ValueError, match="modo"):
+        prototipo.crear_prototipo(raiz, None, modo="otro")
+    with pytest.raises(ValueError, match="carpeta"):
+        prototipo.crear_prototipo(raiz, None)  # el modo proyecto sigue exigiendo la carpeta
+
+
+def test_api_prototipo_de_documento_toma_las_maquetas_del_rfd(proto, tmp_path, monkeypatch):
+    rfd_id, _ = _importar_por_api(proto, tmp_path, monkeypatch)
+    _docx_con_maquetas(Path(servidor.almacen().obtener(rfd_id)["ruta_docx"]))  # el Word del autor trae las maquetas
+    r = proto.post("/api/prototipos", json={"modo": "documento", "rfd_id": rfd_id})
+    assert r.status_code == 200, r.text
+    id_ = r.json()["id"]
+    d = proto.get(f"/api/prototipos/{id_}").json()
+    assert d["modo"] == "documento" and [x["archivo"] for x in d["imagenes"]] == ["img_01.png", "img_02.png"]
+    img = proto.get(f"/api/prototipos/{id_}/imagenes/img_01.png")
+    assert img.status_code == 200 and img.headers["content-type"] == "image/png"
+    for malo in ("..%2Fmeta.json", "meta.json", "img_09.png", "imagenes.json"):
+        assert proto.get(f"/api/prototipos/{id_}/imagenes/{malo}").status_code == 404
+    assert proto.post(f"/api/prototipos/{id_}/levantar", json={"comando": ["npm", "run", "dev"]}).status_code == 400
+    extra = _docx_con_maquetas(tmp_path / "extra" / "pagos.docx")
+    subida = proto.post(f"/api/prototipos/{id_}/imagenes", files=[("archivos", ("pagos.docx", extra.read_bytes()))])
+    assert subida.status_code == 200 and len(subida.json()["imagenes"]) == 2, "las repetidas no se suman"
+    recibidos = _modelo_falso_con_imagenes(monkeypatch, [{"html": _html_proto(), "resumen": "Listo."}])
+    t = _esperar(proto, proto.post(f"/api/prototipos/{id_}/mensaje", data={"texto": "Arma la consulta", "proveedor": "claude",
+                                                                           "imagenes": "img_01.png,img_02.png"}).json()["id"])
+    assert t["estado"] == "listo", t.get("error")
+    assert [p.name for p in recibidos[0]["imagenes"]] == ["img_01.png", "img_02.png"]
+    assert proto.post("/api/prototipos", json={"modo": "documento"}).json()["id"]
+
+
+# ---------------------------------------------------------------- Word con la UI de cada ventana
+
+def _medios_del_word(ruta: Path) -> tuple[dict[str, bytes], str, str, str]:
+    with ZipFile(ruta) as z:
+        medios = {n: z.read(n) for n in z.namelist() if n.startswith("word/media/ui_")}
+        return (medios, z.read("word/document.xml").decode("utf-8"), z.read("word/_rels/document.xml.rels").decode("utf-8"),
+                z.read("[Content_Types].xml").decode("utf-8"))
+
+
+def test_word_inserta_la_maqueta_de_cada_ventana(tmp_path):
+    from generador_rfd.imagenes import agregar_imagen, directorio_ui
+
+    datos = _con_especificacion()
+    ui = directorio_ui(tmp_path, datos["codigo"])
+    principal = agregar_imagen(ui, _png(40, 30, 7), "Consulta › Ventana principal", "", "rfd.docx")
+    detalle = agregar_imagen(ui, _png(30, 40, 8), "Prototipo › RF-01 · Detalle", "", "prototipo v1")
+    ventanas = datos["requerimientos"][0]["vistas"][0]["ventanas"]
+    ventanas[0]["imagen"] = principal["archivo"]
+    ventanas.append({"nombre": "Detalle", "descripcion": "Ventana emergente.", "imagen": "", "secciones": []})
+    r = publicar(datos, tmp_path / "RFD.docx")
+    medios, documento, rels, tipos = _medios_del_word(r.salida)
+    assert sorted(medios.values()) == sorted([_png(40, 30, 7), _png(30, 40, 8)]), "la del prototipo se asocia por RF y ventana"
+    for nombre in medios:
+        rid = re.search(rf'Id="(\w+)"[^>]*Target="media/{Path(nombre).name}"', rels).group(1)
+        assert f'r:embed="{rid}"' in documento
+    assert 'Extension="png"' in tipos
+    texto = texto_docx(r.salida)
+    assert texto.index("Definiciones de la ventana principal") < texto.index("Matriz de resultados")
+    # Sin carpeta de UI, el Word se arma igual y sin imágenes.
+    datos2 = _con_especificacion()
+    datos2["codigo"] = "SIN-UI"
+    assert _medios_del_word(publicar(datos2, tmp_path / "otro" / "RFD.docx").salida)[0] == {}
+
+
+def test_el_detalle_ve_las_maquetas_y_asigna_la_imagen_de_cada_ventana(tmp_path, monkeypatch):
+    from generador_rfd.imagenes import directorio_ui, leer_indice
+    from generador_rfd.modelo import prompt_detalle
+
+    datos = _demo_normalizado()
+    maquetas = [{"archivo": "img_01.png", "titulo": "Portal Público: Control de Anticipos › Ventana principal", "contexto": "Matriz"}]
+    prompt = prompt_detalle(datos, datos["requerimientos"][0], [], maquetas=maquetas)
+    assert "MAQUETAS DISPONIBLES" in prompt and "img_01.png" in prompt and "«imagen»" in prompt
+    # Al continuar, las maquetas del Word del autor y de los documentos de contexto llegan al detalle como imágenes.
+    base = _demo_normalizado()
+    _docx_con_maquetas(tmp_path / "RFD_DEMO.docx")
+    recibido: dict = {}
+
+    def detallar_falso(*, requerimiento, maquetas=None, imagenes=None, **_):
+        recibido.setdefault("maquetas", maquetas)
+        recibido.setdefault("imagenes", imagenes)
+        return {"vistas": [], "integraciones": [], "secciones_reemplazadas": []}
+
+    from generador_rfd import pipeline
+
+    monkeypatch.setattr(pipeline, "continuar_rfd", lambda *, datos, **_: _sin_version(datos))
+    monkeypatch.setattr(pipeline, "asegurar_calidad", _calidad_falsa())
+    monkeypatch.setattr(pipeline, "detallar_requerimiento", detallar_falso)
+    pipeline.continuar(pipeline.OpcionesMejora(base=tmp_path / "RFD_DEMO.docx", salida_dir=tmp_path, datos_base=base, revisar_word=False))
+    ui = directorio_ui(tmp_path, base["codigo"])
+    assert [m["archivo"] for m in recibido["maquetas"]] == ["img_01.png", "img_02.png"] == [m["archivo"] for m in leer_indice(ui)]
+    assert recibido["imagenes"] == [ui / "img_01.png", ui / "img_02.png"]
+
+
+def test_adjuntar_el_prototipo_guarda_cada_pantalla_como_imagen_del_rfd(proto, tmp_path, monkeypatch):
+    from generador_rfd import prototipo
+    from generador_rfd.imagenes import directorio_ui, leer_indice
+
+    rfd_id, _ = _importar_por_api(proto, tmp_path, monkeypatch)
+    _modelo_falso(monkeypatch, [{"html": _html_proto("Uno"), "resumen": "a"}])
+    id_ = _crear_proto(proto, rfd_id)
+    _esperar(proto, proto.post(f"/api/prototipos/{id_}/mensaje", data={"texto": "uno", "proveedor": "claude"}).json()["id"])
+    capturadas = []
+
+    def capturar_falso(html):
+        capturadas.append(html.name)
+        return [("RF-01 · principal", _png(20, 20, 4)), ("RF-01 · Detalle", _png(20, 20, 5))]
+
+    monkeypatch.setattr(prototipo, "capturar_pantallas_html", capturar_falso)
+    r = proto.post(f"/api/prototipos/{id_}/adjuntar-rfd", json={"version": 1})
+    assert r.status_code == 200, r.text
+    assert r.json()["pantallas"] == 2 and capturadas == ["v1.html"]
+    base = servidor.almacen().obtener(rfd_id)
+    ui = directorio_ui(Path(base["ruta_docx"]).parent, base["codigo"])
+    assert [m["titulo"] for m in leer_indice(ui)] == ["Prototipo › RF-01 · principal", "Prototipo › RF-01 · Detalle"]
+
+    def sin_playwright(html):
+        raise RuntimeError(prototipo.INSTALAR_PLAYWRIGHT)
+
+    monkeypatch.setattr(prototipo, "capturar_pantallas_html", sin_playwright)
+    r = proto.post(f"/api/prototipos/{id_}/adjuntar-rfd", json={"version": 1})
+    assert r.status_code == 200 and r.json()["pantallas"] == 0 and "pip install" in r.json()["aviso"]

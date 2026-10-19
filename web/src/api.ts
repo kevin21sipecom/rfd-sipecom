@@ -92,7 +92,7 @@ export interface RfdResumen {
   version: string;
   padre_id: number | null;
   creado: string;
-  origen: "generado" | "mejorado" | "importado";
+  origen: "generado" | "mejorado" | "importado" | "en_avance" | "continuado";
   proveedor: string | null;
   modelo: string | null;
   calidad: number | null;
@@ -122,7 +122,7 @@ export interface RfdDetalle extends Omit<RfdResumen, "preguntas" | "abiertas" | 
   cambios: Cambio[];
   historial: { version: string; fecha: string; descripcion: string }[];
   preguntas: PreguntaGuardada[];
-  archivos: Record<"docx" | "pdf" | "cuestionario" | "revision", boolean>;
+  archivos: Record<"docx" | "pdf" | "cuestionario" | "revision" | "prototipo", boolean>;
 }
 
 export interface Calidad {
@@ -134,9 +134,64 @@ export interface Calidad {
 
 export type Paso = "cola" | "base" | "respuestas" | "fuentes" | "analisis" | "codigo" | "modelo" | "calidad" | "word" | "revision" | "listo";
 
+export interface ImagenMaqueta {
+  archivo: string;
+  titulo: string;
+  contexto: string;
+  origen: string;
+}
+
+export interface EstadoProceso {
+  estado: "detenido" | "iniciando" | "activo" | "error";
+  url: string | null;
+  log: string[];
+  codigo: number | null;
+  externo: boolean;
+}
+
+export interface MensajeChat {
+  rol: "usuario" | "ia";
+  texto: string;
+  cuando: string;
+  version?: number;
+}
+
+export type ModoPrototipo = "documento" | "proyecto";
+
+export interface RfdVinculado {
+  id: number;
+  codigo: string;
+  titulo: string;
+  version: string;
+}
+
+export interface PrototipoResumen {
+  id: string;
+  modo: ModoPrototipo;
+  ruta: string;
+  creado: string;
+  versiones: number;
+  rfd: RfdVinculado | null;
+}
+
+export interface PrototipoDetalle extends Omit<PrototipoResumen, "versiones"> {
+  chat: MensajeChat[];
+  versiones: number[];
+  imagenes: ImagenMaqueta[];
+  proceso: EstadoProceso;
+  captura: { pantallas: { ruta: string; imagen: string; html: string }[] };
+}
+
+export interface ComandoDetectado {
+  etiqueta: string;
+  comando: string[];
+  cwd: string;
+  url_esperada: string | null;
+}
+
 export interface Trabajo {
   id: string;
-  tipo?: "mejora" | "preguntas";
+  tipo?: "mejora" | "preguntas" | "importacion" | "continuacion" | "prototipo" | "captura";
   estado: "en_curso" | "listo" | "error";
   paso: Paso;
   detalle?: string;
@@ -243,6 +298,8 @@ export const api = {
     return pedir<{ leidas: number; guardadas: number; preguntas: PreguntaGuardada[] }>(`/api/rfds/${id}/cuestionario`, { method: "POST", body: f });
   },
   mejorar: (id: number, datos: FormData) => pedir<{ id: string }>(`/api/rfds/${id}/mejorar`, { method: "POST", body: datos }),
+  importar: (datos: FormData) => pedir<{ id: string }>("/api/rfds/importar", { method: "POST", body: datos }),
+  continuar: (id: number, datos: FormData) => pedir<{ id: string }>(`/api/rfds/${id}/continuar`, { method: "POST", body: datos }),
   crearPreguntas: (id: number, datos: FormData) => pedir<{ id: string }>(`/api/rfds/${id}/preguntas`, { method: "POST", body: datos }),
   eliminarRfd: (id: number) => pedir<{ ok: boolean }>(`/api/rfds/${id}`, { method: "DELETE" }),
   abrirRfd: (id: number, tipo: "docx" | "pdf" | "carpeta" | "cuestionario") => pedir<{ ok: boolean }>(`/api/rfds/${id}/abrir?tipo=${tipo}`, { method: "POST" }),
@@ -252,7 +309,26 @@ export const api = {
     : pedir<Regla>(`/api/reglas/${r.id}`, { ...json(r), method: "PUT" }),
   restaurarRegla: (id: number) => pedir<Regla>(`/api/reglas/${id}/restaurar`, { method: "POST" }),
   eliminarRegla: (id: number) => pedir<{ ok: boolean }>(`/api/reglas/${id}`, { method: "DELETE" }),
-  archivoRfd: (id: number, tipo: "docx" | "pdf" | "cuestionario" | "revision" | "json") => `/api/rfds/${id}/archivo/${tipo}`,
+  archivoRfd: (id: number, tipo: "docx" | "pdf" | "cuestionario" | "revision" | "json" | "prototipo") => `/api/rfds/${id}/archivo/${tipo}`,
+  prototipos: () => pedir<PrototipoResumen[]>("/api/prototipos"),
+  prototipo: (id: string) => pedir<PrototipoDetalle>(`/api/prototipos/${id}`),
+  crearPrototipo: (modo: ModoPrototipo, rfd_id: number, ruta = "") => pedir<{ id: string }>("/api/prototipos", json({ modo, rfd_id, ruta })),
+  subirMaquetas: (id: string, archivos: File[]) => {
+    const f = new FormData();
+    archivos.forEach((a) => f.append("archivos", a));
+    return pedir<{ imagenes: ImagenMaqueta[] }>(`/api/prototipos/${id}/imagenes`, { method: "POST", body: f });
+  },
+  detectarComandos: (ruta: string) => pedir<{ comandos: ComandoDetectado[] }>(`/api/prototipos/detectar?ruta=${encodeURIComponent(ruta)}`),
+  levantar: (id: string, cuerpo: { comando?: string[] | string; url_esperada?: string | null; url?: string }) =>
+    pedir<EstadoProceso>(`/api/prototipos/${id}/levantar`, json(cuerpo)),
+  detener: (id: string) => pedir<EstadoProceso>(`/api/prototipos/${id}/detener`, { method: "POST" }),
+  capturar: (id: string, rutas: string[]) => pedir<{ id: string }>(`/api/prototipos/${id}/capturar`, json({ rutas })),
+  mensajePrototipo: (id: string, datos: FormData) => pedir<{ id: string }>(`/api/prototipos/${id}/mensaje`, { method: "POST", body: datos }),
+  adjuntarPrototipo: (id: string, version: number) =>
+    pedir<{ ok: boolean; version: number; archivo: string; pantallas: number; aviso: string }>(`/api/prototipos/${id}/adjuntar-rfd`, json({ version })),
+  imagenPrototipo: (id: string, archivo: string) => `/api/prototipos/${id}/imagenes/${archivo}`,
+  capturaPrototipo: (id: string, archivo: string) => `/api/prototipos/${id}/captura/${archivo}`,
+  versionPrototipo: (id: string, version: number) => `/api/prototipos/${id}/v/${version}`,
   integracion: (codigo: string) => pedir<Integracion>(`/api/integracion?codigo=${encodeURIComponent(codigo)}`),
   enviarEstimador: (id: number, proyecto = "") =>
     pedir<{ ok: boolean; observacion: number; estimador_url: string }>(`/api/rfds/${id}/enviar-estimador`, json({ proyecto })),

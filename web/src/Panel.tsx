@@ -22,6 +22,21 @@ export const PASOS_MEJORA: { id: Paso; texto: string }[] = [
   { id: "revision", texto: "Revisión con Microsoft Word (índice y PDF)" },
 ];
 
+export const PASOS_CONTINUAR: { id: Paso; texto: string }[] = [
+  { id: "base", texto: "Cargando el RFD en avance del historial" },
+  { id: "fuentes", texto: "Leyendo el contexto adicional" },
+  { id: "modelo", texto: "Completando lo que falta sin tocar lo escrito" },
+  { id: "calidad", texto: "Revisión editorial sólo de lo agregado" },
+  { id: "word", texto: "Armando la nueva versión del Word" },
+  { id: "revision", texto: "Revisión con Microsoft Word (índice y PDF)" },
+];
+
+export const PASOS_IMPORTAR: { id: Paso; texto: string }[] = [
+  { id: "base", texto: "Leyendo el Word en avance" },
+  { id: "modelo", texto: "Reconstruyendo la estructura del RFD" },
+  { id: "calidad", texto: "Midiendo qué le falta al RFD" },
+];
+
 const ORDEN: Paso[] = ["cola", "base", "respuestas", "fuentes", "analisis", "codigo", "modelo", "calidad", "word", "revision", "listo"];
 
 function useSegundos(inicio: number, fin?: number) {

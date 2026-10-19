@@ -53,6 +53,42 @@ SCHEMA_ANALISIS: dict[str, Any] = {
 
 PARRAFOS = arr(STRING)
 
+# Especificación detallada de una opción, por portal o perfil: el nivel de un RFD con pantallas
+# (definiciones generales, ventanas con sus secciones y campos, reglas de negocio) e integraciones.
+VISTA = obj(
+    {
+        "portal": STRING,
+        "definiciones_generales": STRINGS,
+        "ventanas": arr(
+            obj(
+                {
+                    "nombre": STRING,
+                    "descripcion": STRING,
+                    # Maqueta o captura que muestra la ventana (img_NN de la carpeta de UI del RFD); vacía si no hay.
+                    "imagen": STRING,
+                    "secciones": arr(
+                        obj(
+                            {
+                                "nombre": STRING,
+                                "descripcion": STRING,
+                                "campos": arr(obj({"nombre": STRING, "tipo": STRING, "descripcion": STRING})),
+                            }
+                        )
+                    ),
+                }
+            )
+        ),
+        "reglas_negocio": STRINGS,
+    }
+)
+ESPECIFICACION = {"vistas": arr(VISTA), "integraciones": arr(obj({"servicio": STRING, "descripcion": STRING}))}
+
+# Detalle de un requerimiento (una llamada por opción). Las secciones reemplazadas son resúmenes superados.
+SCHEMA_DETALLE: dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    **obj({**ESPECIFICACION, "secciones_reemplazadas": STRINGS}),
+}
+
 SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     **obj(
@@ -93,6 +129,7 @@ SCHEMA: dict[str, Any] = {
                         ),
                         "criterios_aceptacion": STRINGS,
                         "evidencias": STRINGS,
+                        **ESPECIFICACION,
                     }
                 )
             ),
@@ -200,6 +237,12 @@ def normalizar(datos: dict[str, Any]) -> dict[str, Any]:
     datos.setdefault("cambios", [])
     datos.setdefault("version", "0.1")
     datos.setdefault("historial", [])
+    for r in datos.get("requerimientos", []):
+        r.setdefault("vistas", [])
+        r.setdefault("integraciones", [])
+        for v in r["vistas"]:
+            for ventana in v.get("ventanas", []):
+                ventana.setdefault("imagen", "")
     return datos
 
 
@@ -243,6 +286,10 @@ def auditar_contenido(d: dict[str, Any]) -> list[Hallazgo]:
         for c in r["criterios_aceptacion"]:
             if any(v in c.lower() for v in VAGOS):
                 h.append(Hallazgo("criterio_vago", f"{ref} contiene un criterio no verificable: {c}"))
+        for v in r["vistas"]:
+            if not v["ventanas"] or not v["reglas_negocio"]:
+                h.append(Hallazgo("especificacion_incompleta",
+                                  f"{ref} ({v['portal'] or 'sin portal'}) necesita ventanas y reglas de negocio en su especificación."))
     if d["tipo_proyecto"] == "existente" and not d["componentes"]["items"]:
         h.append(Hallazgo("componentes_faltantes", "No se identificaron componentes existentes a adecuar."))
     if not d["entregables"]:

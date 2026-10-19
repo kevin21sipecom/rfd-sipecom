@@ -14,14 +14,20 @@ from __future__ import annotations
 import json
 from datetime import date
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+from zipfile import BadZipFile
+
+from lxml import etree
 
 from .fuentes import Fuente, cargar_fuentes, leer_documento, limite_para
+from .imagenes import directorio_ui, extraer_imagenes, leer_indice
 from .calidad import UMBRAL, Evaluacion, evaluar, instrucciones_correccion
 from .reglas import Regla, bloque_prompt, incumplidas
-from .modelo import Uso, adaptar_rfd, analizar_fuentes, corregir_rfd, reconstruir_rfd, redactar_rfd, temas_de_codigo
+from .modelo import (Uso, adaptar_rfd, analizar_fuentes, continuar_rfd, corregir_rfd, detallar_requerimiento, reconstruir_rfd,
+                     redactar_rfd, temas_de_codigo)
 from .schema import Hallazgo, auditar_contenido, auditar_texto_final, normalizar, validar_estructura
 from .word import crear_docx, texto_docx
 
@@ -46,6 +52,7 @@ class Opciones:
     esfuerzo: str = ""
     titulo: str | None = None
     estilos: list[Path] = field(default_factory=list)
+    avances: list[Path] = field(default_factory=list)
     proyecto: Path | None = None
     enfoque: str = ""
     publico: bool = False
@@ -164,7 +171,8 @@ def publicar(datos: dict, salida: Path, plantilla: Path = PLANTILLA, publico: bo
         raise ValueError(f"El modo público exige resolver {len(hallazgos)} hallazgo(s). Revise {informe}.")
     if progreso:
         progreso("word", "Armando el Word con la plantilla SIPECOM")
-    crear_docx(datos, plantilla.expanduser().resolve(), salida)
+    ui = directorio_ui(salida.parent, datos["codigo"])
+    crear_docx(datos, plantilla.expanduser().resolve(), salida, ui if ui.is_dir() else None)
     salida.with_suffix(".json").write_text(json.dumps(datos, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     from .cuestionario import crear_cuestionario
 
@@ -195,7 +203,7 @@ def generar(o: Opciones, progreso: Progreso | None = None) -> Resultado:
     avisar = progreso or (lambda paso, detalle: None)
     directorio = o.salida.expanduser().resolve().parent
     avisar("fuentes", "Leyendo transcripciones, contexto y referencias de estilo")
-    fuentes = cargar_fuentes(o.transcripciones, o.contextos, o.estilos, limite_para(o.proveedor))
+    fuentes = cargar_fuentes(o.transcripciones, o.contextos, o.estilos, limite_para(o.proveedor), avances=o.avances)
     uso = Uso()
 
     avisar("analisis", "Analizando cada documento")
@@ -216,8 +224,9 @@ def generar(o: Opciones, progreso: Progreso | None = None) -> Resultado:
         if restante < 5_000:
             raise ValueError("No queda espacio para el contexto del código; reduzca los documentos.")
         codigo = analizar_proyecto(o.proyecto, temas, min(90_000, restante))
-        n = sum(1 for f in fuentes if f.categoria != "estilo") + 1
-        fuentes.insert(n - 1, Fuente(f"F{n:02}", codigo.nombre, codigo.categoria, codigo.contenido))
+        n = sum(1 for f in fuentes if f.categoria not in ("estilo", "avance")) + 1
+        posicion = sum(1 for f in fuentes if f.categoria != "estilo")
+        fuentes.insert(posicion, Fuente(f"F{n:02}", codigo.nombre, codigo.categoria, codigo.contenido))
 
     avisar("modelo", "Redactando el RFD")
     datos = redactar_rfd(
@@ -225,19 +234,94 @@ def generar(o: Opciones, progreso: Progreso | None = None) -> Resultado:
         tipo_proyecto=o.tipo_proyecto, fecha=o.fecha, titulo=o.titulo, proveedor=o.proveedor, modelo=o.modelo,
         directorio_salida=directorio, analisis=analisis, uso=uso, esfuerzo=o.esfuerzo, reglas=bloque_prompt(o.reglas),
     )
-    datos, calidad = asegurar_calidad(datos, o, analisis, uso, directorio, avisar)
+    # El texto del autor se entrega al corrector para que la revisión editorial no lo reescriba.
+    autor = "\n\n".join(f.para_prompt() for f in fuentes if f.categoria == "avance")
+    datos, calidad = asegurar_calidad(datos, o, analisis, uso, directorio, avisar, preservar=autor)
+    ui = reunir_maquetas([*o.avances, *o.contextos, *o.transcripciones], directorio_ui(o.salida.expanduser().resolve().parent, o.codigo))
+    detalle = detallar(datos, [f for f in fuentes if f.categoria != "estilo"], analisis, o, uso, directorio, avisar, registrar=False, ui=ui)
     return publicar(datos, o.salida, o.plantilla, o.publico, revisar_word=o.revisar_word,
                     terminos=terminos_ajenos(fuentes, o.cliente), uso=uso.como_dict(), fuentes=fuentes, progreso=avisar,
-                    calidad=calidad, extra_hallazgos=hallazgos_reglas(datos, o.reglas))
+                    calidad=calidad, extra_hallazgos=hallazgos_reglas(datos, o.reglas) + (hallazgos_calidad_autor(calidad) if autor else []) + detalle)
+
+
+def _palabras(textos: Any) -> int:
+    if isinstance(textos, str):
+        return len(textos.split())
+    if isinstance(textos, dict):
+        return sum(_palabras(v) for v in textos.values())
+    return sum(_palabras(v) for v in textos) if isinstance(textos, list) else 0
+
+
+MAX_MAQUETAS_DETALLE = 12
+
+
+def reunir_maquetas(documentos: list[Path], ui: Path) -> Path:
+    """Suma a la carpeta de UI del RFD las maquetas de los Word de entrada (las repetidas no se duplican)."""
+    for doc in documentos:
+        if doc.suffix.lower() == ".docx" and doc.is_file():
+            extraer_imagenes(doc, ui)
+    return ui
+
+
+def detallar(datos: dict, fuentes: list[Fuente], analisis: dict[str, dict[str, Any]] | None, o: Any, uso: Uso, directorio: Path,
+             avisar: Progreso, registrar: bool = True, instruccion: str = "", ui: Path | None = None) -> list[Hallazgo]:
+    """Redacta la especificación por pantalla de cada opción, una llamada por requerimiento.
+
+    En una sola redacción el modelo comprime todas las opciones al mismo molde breve; por separado, cada una
+    recibe las fuentes completas y la sección más detallada del autor como modelo. Una sección general que
+    resumía la opción se quita sólo si la especificación nueva es más extensa que ella. Las maquetas de `ui`
+    viajan como imágenes: el modelo lee de ellas columnas y campos, y asigna a cada ventana la que la muestra.
+    """
+    hallazgos: list[Hallazgo] = []
+    maquetas = leer_indice(ui)[:MAX_MAQUETAS_DETALLE] if ui else []
+    extra = {"maquetas": maquetas, "imagenes": [ui / m["archivo"] for m in maquetas]} if maquetas and ui else {}
+    pendientes = [r for r in datos["requerimientos"] if not r["vistas"] and not r["elementos"]]
+    for i, r in enumerate(pendientes, 1):
+        avisar("detalle", f"Especificando pantallas y reglas ({i}/{len(pendientes)}): {r['nombre'] or r['id']}")
+        try:
+            detalle = detallar_requerimiento(datos=datos, requerimiento=r, fuentes=fuentes, analisis=analisis, proveedor=o.proveedor,
+                                             modelo=o.modelo, directorio_salida=directorio, uso=uso, esfuerzo=o.esfuerzo,
+                                             reglas=bloque_prompt(getattr(o, "reglas", [])), instruccion=instruccion, **extra)
+        except (RuntimeError, ValueError) as e:
+            hallazgos.append(Hallazgo("detalle_no_generado", f"{r['id']}: no se pudo redactar la especificación detallada ({str(e)[:160]})."))
+            continue
+        if not detalle["vistas"]:
+            continue
+        validas = {m["archivo"] for m in maquetas}
+        for v in detalle["vistas"]:
+            for ventana in v["ventanas"]:
+                if ventana["imagen"] not in validas:   # sólo maquetas reales: el modelo no inventa archivos
+                    ventana["imagen"] = ""
+        r["vistas"], r["integraciones"] = detalle["vistas"], detalle["integraciones"]
+        extension = _palabras(detalle["vistas"]) + _palabras(detalle["integraciones"])
+        reemplazar = set(detalle["secciones_reemplazadas"])
+        quitadas = [s["titulo"] for s in datos["secciones_generales"] if s["titulo"] in reemplazar and _palabras(s["parrafos"]) < extension]
+        datos["secciones_generales"] = [s for s in datos["secciones_generales"] if s["titulo"] not in quitadas]
+        if registrar:
+            reglas_n = sum(len(v["reglas_negocio"]) for v in r["vistas"])
+            cambio = f"Se agregó la especificación detallada: {len(r['vistas'])} vista(s), {reglas_n} regla(s) de negocio"
+            cambio += f"; reemplaza el resumen «{'», «'.join(quitadas)}»." if quitadas else "."
+            datos["cambios"].append({"pregunta": "Continuación", "seccion": f"{r['id']} {r['nombre']}".strip(), "cambio": cambio})
+    return hallazgos
 
 
 def hallazgos_reglas(datos: dict, reglas: list[Regla]) -> list[Hallazgo]:
     return [Hallazgo("regla_incumplida", f"{r.etiqueta} «{r.texto}»: {detalle}") for r, detalle in incumplidas(datos, reglas)]
 
 
+def hallazgos_calidad_autor(calidad: dict[str, Any]) -> list[Hallazgo]:
+    """Criterios que siguen sin cumplirse cuando el texto del autor no se reescribe: se informan, no se corrigen."""
+    return [Hallazgo("calidad_texto_autor", f"{c['id']}: {c['descripcion']}" + (f" ({c['detalle']})" if c["detalle"] else "")
+                     + ". Puede provenir del texto del autor, que se conservó sin cambios.")
+            for c in calidad["criterios"] if not c["ok"]]
+
+
 def asegurar_calidad(datos: dict, o: Any, analisis: dict[str, dict[str, Any]] | None, uso: Uso, directorio: Path,
-                     avisar: Progreso, con_codigo: bool | None = None) -> tuple[dict, dict]:
-    """Evalúa el nivel narrativo y pide al mismo motor corregir sólo lo que no cumple; conserva la mejor versión."""
+                     avisar: Progreso, con_codigo: bool | None = None, preservar: str = "") -> tuple[dict, dict]:
+    """Evalúa el nivel narrativo y pide al mismo motor corregir sólo lo que no cumple; conserva la mejor versión.
+
+    `preservar` es el texto del autor (RFD en avance): el corrector no puede alterarlo.
+    """
     con_codigo = (getattr(o, "proyecto", None) is not None) if con_codigo is None else con_codigo
     reglas: list[Regla] = getattr(o, "reglas", [])
     mejor, ev = datos, evaluar(datos, analisis, con_codigo, reglas)
@@ -249,11 +333,16 @@ def asegurar_calidad(datos: dict, o: Any, analisis: dict[str, dict[str, Any]] | 
         try:
             candidato = corregir_rfd(datos=mejor, fallas=instrucciones_correccion(ev), analisis=analisis,
                                      proveedor=o.proveedor, modelo=o.modelo, directorio_salida=directorio,
-                                     uso=uso, esfuerzo=o.esfuerzo, reglas=bloque_prompt(reglas))
+                                     uso=uso, esfuerzo=o.esfuerzo, reglas=bloque_prompt(reglas), preservar=preservar)
         except (RuntimeError, ValueError) as e:
             avisar("calidad", f"La revisión editorial no se aplicó: {str(e)[:160]}")
             break
         candidato.update({k: mejor[k] for k in ("version", "historial") if k in mejor})
+        # La rúbrica no mide la especificación por pantalla: el corrector no puede resumirla ni quitarla.
+        previos = {r["id"]: r for r in mejor["requerimientos"]}
+        for r in candidato["requerimientos"]:
+            if r["id"] in previos:
+                r["vistas"], r["integraciones"] = previos[r["id"]]["vistas"], previos[r["id"]]["integraciones"]
         nueva: Evaluacion = evaluar(candidato, analisis, con_codigo, reglas)
         if nueva.puntaje >= ev.puntaje:
             mejor, ev = candidato, nueva
@@ -282,6 +371,7 @@ class OpcionesMejora:
     datos_base: dict[str, Any] | None = None      # RFD del historial (SQLite): evita volver a cargar archivos
     analisis_base: dict[str, Any] | None = None
     reglas: list[Regla] = field(default_factory=list)
+    instruccion: str = ""                         # sólo al continuar: qué falta o en qué enfocarse
 
 
 def siguiente_version(version: str) -> str:
@@ -359,19 +449,130 @@ def mejorar(o: OpcionesMejora, progreso: Progreso | None = None) -> Resultado:
     if eliminados:
         extra.append(Hallazgo("rf_eliminado", f"La adaptación eliminó {', '.join(eliminados)}; verifique que el cliente lo pidió."))
 
+    registro = {"base": str(o.base), "respuestas": lista, "adjuntos": [a.nombre for a in adjuntos]}
+    return _publicar_version(o, nuevo, version, registro, adjuntos, extra, uso, avisar)
+
+
+def _publicar_version(o: OpcionesMejora, nuevo: dict[str, Any], version: str, registro: dict[str, Any], adjuntos: list[Fuente],
+                      extra: list[Hallazgo], uso: Uso, avisar: Progreso, preservar: str = "", detalle: bool = False) -> Resultado:
+    """Revisión editorial, archivos de apoyo y Word de la versión nueva (compartido por mejorar y continuar).
+
+    Con `detalle`, después de la revisión se especifica por pantalla cada opción que aún no la tenga.
+    """
+    # Un importado conserva su «_importado[_N]»: sin él compartiría nombre (y análisis) con el RFD generado del mismo código.
     stem = re.sub(r"(_v\d+\.\d+)?(_editado)?$", "", o.base.stem)
     ruta_analisis = o.base.with_name(f"{stem}.analisis.json")
     analisis = o.analisis_base or (json.loads(ruta_analisis.read_text(encoding="utf-8")) if ruta_analisis.is_file() else None)
     con_codigo = any(c["ubicacion"].strip() for c in nuevo["componentes"]["items"])
-    nuevo, calidad = asegurar_calidad(nuevo, o, analisis, uso, o.salida_dir, avisar, con_codigo)
+    nuevo, calidad = asegurar_calidad(nuevo, o, analisis, uso, o.salida_dir, avisar, con_codigo, preservar=preservar)
+    if detalle:
+        # Maquetas del Word del autor (el base, si es un .docx) y de los documentos de contexto.
+        ui = reunir_maquetas([o.base, *o.adjuntos], directorio_ui(o.salida_dir, nuevo["codigo"]))
+        extra += detallar(nuevo, adjuntos, analisis, o, uso, o.salida_dir, avisar, instruccion=o.instruccion, ui=ui)
     extra += hallazgos_reglas(nuevo, o.reglas)
+    if preservar:
+        extra += hallazgos_calidad_autor(calidad)
 
     salida = o.salida_dir / f"{stem}_v{version}.docx"
     salida.with_suffix(".respuestas.json").parent.mkdir(parents=True, exist_ok=True)
-    salida.with_suffix(".respuestas.json").write_text(
-        json.dumps({"base": str(o.base), "respuestas": lista, "adjuntos": [a.nombre for a in adjuntos]}, ensure_ascii=False, indent=2),
-        encoding="utf-8")
+    salida.with_suffix(".respuestas.json").write_text(json.dumps(registro, ensure_ascii=False, indent=2), encoding="utf-8")
     if analisis:
         salida.with_suffix(".analisis.json").write_text(json.dumps(analisis, ensure_ascii=False, indent=2), encoding="utf-8")
     return publicar(nuevo, salida, o.plantilla, False, revisar_word=o.revisar_word, uso=uso.como_dict(),
                     fuentes=adjuntos, progreso=avisar, calidad=calidad, extra_hallazgos=extra)
+
+
+def continuar(o: OpcionesMejora, progreso: Progreso | None = None) -> Resultado:
+    """Continúa un RFD a medio redactar: conserva lo escrito y completa lo que falta; no requiere respuestas del cliente."""
+    avisar = progreso or (lambda paso, detalle: None)
+    uso = Uso()
+    avisar("base", "Cargando el RFD en avance")
+    base = cargar_base(o, uso, avisar)
+
+    avisar("fuentes", "Leyendo el contexto adicional")
+    contexto = [Fuente(f"C{i:02}", r.name, "contexto", leer_documento(r)) for i, r in enumerate(o.adjuntos, 1)]
+
+    avisar("modelo", f"Completando el RFD con {len(contexto)} documento(s) de contexto")
+    nuevo = continuar_rfd(datos=base, contexto=contexto, instruccion=o.instruccion, proveedor=o.proveedor, modelo=o.modelo,
+                          directorio_salida=o.salida_dir, uso=uso, esfuerzo=o.esfuerzo, reglas=bloque_prompt(o.reglas))
+    version = siguiente_version(base.get("version", "0.1"))
+    nuevo["version"] = version
+    nuevo["historial"] = base.get("historial", []) + [{
+        "version": version, "fecha": date.today().strftime("%d/%m/%Y"),
+        "descripcion": "Continuación del RFD en avance" + (f" con {len(contexto)} documento(s) de contexto" if contexto else ""),
+    }]
+
+    extra: list[Hallazgo] = []
+    eliminados = sorted({x["id"] for x in base["requerimientos"]} - {x["id"] for x in nuevo["requerimientos"]})
+    if eliminados:
+        extra.append(Hallazgo("rf_eliminado", f"La continuación eliminó {', '.join(eliminados)}; el texto del autor debía conservarse."))
+    # El corrector recibe todo lo que existía antes: sólo puede ajustar lo que la IA agregó o completó.
+    autor = json.dumps({k: v for k, v in base.items() if k not in ("version", "historial")}, ensure_ascii=False)
+    registro = {"base": str(o.base), "instruccion": o.instruccion, "contexto": [c.nombre for c in contexto]}
+    return _publicar_version(o, nuevo, version, registro, contexto, extra, uso, avisar, preservar=autor, detalle=True)
+
+
+# ---------------------------------------------------------------- Importar un RFD en avance al historial
+
+@dataclass
+class OpcionesImportacion:
+    archivo: Path
+    salida_dir: Path
+    cliente: str
+    codigo: str
+    titulo: str | None = None
+    tipo_proyecto: str = "existente"
+    proveedor: str = "claude"
+    modelo: str = ""
+    esfuerzo: str = ""
+    reglas: list[Regla] = field(default_factory=list)
+
+
+def leer_avance(ruta: Path) -> str:
+    """Texto del Word en avance; falla con un mensaje claro si no es un .docx legible o no tiene texto."""
+    if ruta.suffix.lower() != ".docx":
+        raise ValueError("Sólo se admite un archivo Word (.docx).")
+    if not ruta.is_file():
+        raise ValueError(f"No existe el archivo: {ruta}")
+    try:
+        texto = texto_docx(ruta)
+    except (BadZipFile, KeyError, etree.XMLSyntaxError, OSError) as e:
+        raise ValueError(f"No se pudo leer el Word: está dañado o no es un .docx válido ({type(e).__name__}).") from e
+    if not texto.strip():
+        raise ValueError(f"El Word no contiene texto: {ruta.name}.")
+    return texto
+
+
+def importar(o: OpcionesImportacion, progreso: Progreso | None = None) -> Resultado:
+    """Reconstruye un RFD en avance (.docx) al esquema y lo deja listo para registrarse en el historial.
+
+    No redacta nada: el Word del autor se conserva tal cual (es el archivo enlazado) y sólo se mide su estado.
+    """
+    avisar = progreso or (lambda paso, detalle: None)
+    uso = Uso()
+    avisar("base", "Leyendo el Word en avance")
+    texto = leer_avance(o.archivo)
+    avisar("modelo", "Reconstruyendo la estructura del RFD desde el Word")
+    datos = normalizar(reconstruir_rfd(
+        texto=texto, cliente=o.cliente, codigo=o.codigo, tipo_proyecto=o.tipo_proyecto, fecha=date.today().strftime("%d/%m/%Y"),
+        proveedor=o.proveedor, modelo=o.modelo, directorio_salida=o.salida_dir, uso=uso, esfuerzo=o.esfuerzo,
+    ))
+    if o.titulo:
+        datos["titulo"] = o.titulo
+    validar_estructura(datos)
+
+    avisar("calidad", "Midiendo qué le falta al RFD")
+    o.salida_dir.mkdir(parents=True, exist_ok=True)
+    codigo = re.sub(r"[^\w.\- ]+", "_", o.codigo).strip().replace(" ", "_")
+    base = f"RFD_{codigo}_importado"
+    salida, n = o.salida_dir / f"{base}.docx", 1
+    while salida.exists():   # una segunda importación del mismo código no pisa la anterior
+        n += 1
+        salida = o.salida_dir / f"{base}_{n}.docx"
+    shutil.copyfile(o.archivo, salida)
+    salida.with_suffix(".json").write_text(json.dumps(datos, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    calidad = {**evaluar(datos, None, False, o.reglas).como_dict(), "rondas": 0, "reglas": [r.como_dict() for r in o.reglas if r.activa]}
+    hallazgos = auditar_contenido(datos) + hallazgos_reglas(datos, o.reglas)
+    escribir_informe(datos, hallazgos, salida.with_suffix(".revision.md"), uso.como_dict(), None, None, calidad)
+    return Resultado(datos, hallazgos, salida, [], uso.como_dict(), None, calidad)

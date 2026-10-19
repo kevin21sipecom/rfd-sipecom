@@ -74,6 +74,7 @@ def parser() -> argparse.ArgumentParser:
     g.add_argument("--transcripcion", type=Path, action="append", default=[], help="Opcional si se indica al menos un --contexto.")
     g.add_argument("--contexto", type=Path, action="append", default=[])
     g.add_argument("--estilo", type=Path, action="append", default=[], help="RFD de referencia: sólo se imita su redacción y estructura.")
+    g.add_argument("--avance", type=Path, action="append", default=[], help="RFD en avance que la IA debe continuar: conserva lo escrito y completa lo que falta.")
     g.add_argument("--proyecto", type=Path, help="Carpeta del código existente (uno o varios repositorios).")
     g.add_argument("--enfoque", default="", help="Tema para buscar en el código; por defecto, los temas detectados en cada documento.")
     g.add_argument("--cliente", required=True)
@@ -106,6 +107,23 @@ def parser() -> argparse.ArgumentParser:
     m.add_argument("--modelo", default="")
     m.add_argument("--esfuerzo", default="")
     m.add_argument("--sin-word", action="store_true")
+    i = sub.add_parser("importar", help="Registra en el historial un RFD en avance (.docx) para continuarlo después.")
+    i.add_argument("archivo", type=Path, help="Word del RFD a medio redactar.")
+    i.add_argument("--cliente", required=True)
+    i.add_argument("--codigo", required=True)
+    i.add_argument("--titulo")
+    i.add_argument("--tipo-proyecto", choices=["nuevo", "existente"], default="existente")
+    i.add_argument("--proveedor", choices=PROVEEDORES, default="claude")
+    i.add_argument("--modelo", default="")
+    i.add_argument("--esfuerzo", default="")
+    ct = sub.add_parser("continuar", help="Continúa un RFD del historial: conserva lo escrito y completa lo que falta (versión siguiente).")
+    ct.add_argument("--id", type=int, required=True, help="ID del RFD en el historial (vea `generador-rfd historial`).")
+    ct.add_argument("--contexto", type=Path, action="append", default=[], help="Documento de contexto para completar (.txt, .md, .docx, .pptx, .pdf, .xlsx).")
+    ct.add_argument("--instruccion", default="", help="Qué falta o en qué enfocarse.")
+    ct.add_argument("--proveedor", choices=PROVEEDORES, default="claude")
+    ct.add_argument("--modelo", default="")
+    ct.add_argument("--esfuerzo", default="")
+    ct.add_argument("--sin-word", action="store_true")
     rg = sub.add_parser("reglas", help="Lista, agrega, activa o elimina reglas del equipo que se inyectan al modelo.")
     rg.add_argument("--agregar", metavar="TEXTO", help="Texto de la regla, p. ej. «No usar etc. ni entre otros».")
     rg.add_argument("--tipo", choices=["evitar", "exigir"], default="evitar")
@@ -157,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
             from .servidor import almacen
 
             _mostrar(generar(Opciones(
-                transcripciones=a.transcripcion, contextos=a.contexto, estilos=a.estilo, proyecto=a.proyecto,
+                transcripciones=a.transcripcion, contextos=a.contexto, estilos=a.estilo, avances=a.avance, proyecto=a.proyecto,
                 enfoque=a.enfoque, cliente=a.cliente, codigo=a.codigo, tipo_proyecto=a.tipo_proyecto,
                 titulo=a.titulo, fecha=a.fecha, proveedor=a.proveedor, modelo=a.modelo, salida=a.salida,
                 plantilla=a.plantilla, publico=a.publico, revisar_word=not a.sin_word, esfuerzo=a.esfuerzo,
@@ -199,6 +217,37 @@ def main(argv: list[str] | None = None) -> int:
             _mostrar(r)
             print(f"Versión {r.datos['version']} registrada con ID {nuevo}; {len(r.datos['cambios'])} cambio(s), "
                   f"{len(r.datos['preguntas_cliente'])} pregunta(s) abiertas.")
+        elif a.comando == "importar":
+            from .pipeline import OpcionesImportacion, importar
+            from .servidor import SALIDAS, _registrar, almacen
+
+            o = OpcionesImportacion(
+                archivo=a.archivo, salida_dir=SALIDAS, cliente=a.cliente.strip(), codigo=a.codigo.strip(), titulo=a.titulo,
+                tipo_proyecto=a.tipo_proyecto, proveedor=a.proveedor,
+                modelo=a.modelo or (MODELO_CLAUDE_DEFECTO if a.proveedor == "claude" else ""),
+                esfuerzo=a.esfuerzo, reglas=almacen().reglas_para(a.cliente),
+            )
+            r = importar(o, lambda paso, detalle: print(f"[{paso}] {detalle}", flush=True))
+            nuevo = _registrar(r, "en_avance", o.proveedor, o.modelo)
+            _mostrar(r)
+            print(f"RFD en avance registrado con ID {nuevo}; continúelo con `generador-rfd continuar --id {nuevo}`.")
+        elif a.comando == "continuar":
+            from .pipeline import OpcionesMejora, continuar
+            from .servidor import SALIDAS, _registrar, almacen
+
+            base = almacen().obtener(a.id)
+            o = OpcionesMejora(
+                base=Path(base["ruta_docx"] or SALIDAS / f"RFD_{base['codigo']}.docx"), salida_dir=SALIDAS, adjuntos=a.contexto,
+                instruccion=a.instruccion.strip(), proveedor=a.proveedor,
+                modelo=a.modelo or (MODELO_CLAUDE_DEFECTO if a.proveedor == "claude" else ""),
+                esfuerzo=a.esfuerzo, revisar_word=not a.sin_word, datos_base=base["datos"], analisis_base=base["analisis"],
+                reglas=almacen().reglas_para(base["cliente"]),
+            )
+            r = continuar(o, lambda paso, detalle: print(f"[{paso}] {detalle}", flush=True))
+            nuevo = _registrar(r, "continuado", o.proveedor, o.modelo, padre_id=a.id)
+            _mostrar(r)
+            print(f"Versión {r.datos['version']} registrada con ID {nuevo}; {len(r.datos['cambios'])} cambio(s), "
+                  f"{len(r.hallazgos)} hallazgo(s) por revisar.")
         return 0
     except (OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError) as e:
         print(f"Error: {e}", file=sys.stderr)

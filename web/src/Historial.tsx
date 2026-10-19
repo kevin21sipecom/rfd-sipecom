@@ -1,11 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type PreguntaGuardada, type RfdDetalle, type RfdResumen, type Trabajo } from "./api";
-import { Icono, ZonaArchivos } from "./components";
+import { Campo, Icono, Segmentado, ZonaArchivos } from "./components";
 import { EnviarEstimador } from "./Estimador";
 import type { Motor } from "./Motor";
-import { PASOS_MEJORA, Progreso, ResultadoVista } from "./Panel";
+import { PASOS_CONTINUAR, PASOS_IMPORTAR, PASOS_MEJORA, Progreso, ResultadoVista } from "./Panel";
+import { PanelPrototipo } from "./Prototipo";
 
 const EXTENSIONES = [".txt", ".md", ".docx", ".pptx", ".pdf", ".xlsx"];
+
+const ORIGEN: Record<string, string> = { generado: "generado", mejorado: "mejorado", importado: "importado", en_avance: "en avance", continuado: "continuado" };
+
+function pasosDe(t: Trabajo) {
+  if (t.tipo === "preguntas") return undefined;
+  return t.tipo === "continuacion" ? PASOS_CONTINUAR : t.tipo === "importacion" ? PASOS_IMPORTAR : PASOS_MEJORA;
+}
 
 interface Proyecto {
   clave: string;
@@ -91,6 +99,14 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
   const [seleccion, setSeleccion] = useState<number | null>(seleccionInicial);
   const [detalle, setDetalle] = useState<RfdDetalle | null>(null);
   const [adjuntos, setAdjuntos] = useState<File[]>([]);
+  const [modo, setModo] = useState<"mejorar" | "continuar" | "prototipo">("mejorar");
+  const [contexto, setContexto] = useState<File[]>([]);
+  const [instruccion, setInstruccion] = useState("");
+  const [importando, setImportando] = useState(false);
+  const [archivoAvance, setArchivoAvance] = useState<File | null>(null);
+  const [clienteAvance, setClienteAvance] = useState("");
+  const [codigoAvance, setCodigoAvance] = useState("");
+  const [tituloAvance, setTituloAvance] = useState("");
   const [revisarWord, setRevisarWord] = useState(true);
   const [trabajo, setTrabajo] = useState<Trabajo | null>(null);
   const [aviso, setAviso] = useState("");
@@ -104,10 +120,17 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
   useEffect(() => {
     if (seleccion == null) { setDetalle(null); return; }
     setDetalle(null);
-    setTrabajo(null);
+    // Una importación en curso sigue visible aunque se cambie de RFD en la lista.
+    setTrabajo((t) => (t?.tipo === "importacion" && t.estado === "en_curso" ? t : null));
     setAdjuntos([]);
+    setContexto([]);
+    setInstruccion("");
     setAviso("");
-    api.rfd(seleccion).then(setDetalle).catch((e: Error) => setError(e.message));
+    api.rfd(seleccion).then((d) => {
+      setDetalle(d);
+      // Quien está prototipando sigue en esa pestaña al cambiar de RFD.
+      setModo((m) => (m === "prototipo" ? m : d.origen === "en_avance" || d.origen === "continuado" ? "continuar" : "mejorar"));
+    }).catch((e: Error) => setError(e.message));
   }, [seleccion]);
   useEffect(() => {
     if (seleccion == null && lista.length) setSeleccion(agrupar(lista)[0].principal.id);
@@ -118,6 +141,12 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
     const t = setInterval(() => api.trabajo(trabajo.id).then((x) => {
       setTrabajo(x);
       if (x.estado === "listo") recargarLista();
+      if (x.estado === "listo" && x.tipo === "importacion" && x.resultado?.rfd_id) {
+        // El proyecto importado se abre en el historial, listo para continuarlo.
+        setImportando(false);
+        setArchivoAvance(null);
+        setSeleccion(x.resultado.rfd_id);
+      }
     }).catch((e: Error) => setError(e.message)), 1500);
     return () => clearInterval(t);
   }, [trabajo, recargarLista]);
@@ -138,7 +167,7 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
     } catch (e) { setError((e as Error).message); }
   };
 
-  const lanzar = async (tipo: "mejora" | "preguntas") => {
+  const lanzar = async (tipo: "mejora" | "preguntas" | "continuar") => {
     if (!detalle) return;
     setError("");
     const f = new FormData();
@@ -147,8 +176,29 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
       adjuntos.forEach((a) => f.append("adjuntos", a));
       f.append("revisar_word", String(revisarWord && wordDisponible));
     }
+    if (tipo === "continuar") {
+      contexto.forEach((a) => f.append("adjuntos", a));
+      f.append("instruccion", instruccion.trim());
+      f.append("revisar_word", String(revisarWord && wordDisponible));
+    }
     try {
-      const { id } = tipo === "mejora" ? await api.mejorar(detalle.id, f) : await api.crearPreguntas(detalle.id, f);
+      const { id } = tipo === "mejora" ? await api.mejorar(detalle.id, f)
+        : tipo === "continuar" ? await api.continuar(detalle.id, f) : await api.crearPreguntas(detalle.id, f);
+      setTrabajo(await api.trabajo(id));
+    } catch (e) { setError((e as Error).message); }
+  };
+
+  const importar = async () => {
+    if (!archivoAvance) return;
+    setError("");
+    const f = new FormData();
+    motor.agregar(f);
+    f.append("archivo", archivoAvance);
+    f.append("cliente", clienteAvance.trim());
+    f.append("codigo", codigoAvance.trim());
+    f.append("titulo", tituloAvance.trim());
+    try {
+      const { id } = await api.importar(f);
       setTrabajo(await api.trabajo(id));
     } catch (e) { setError((e as Error).message); }
   };
@@ -156,6 +206,14 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
   const respondidas = detalle?.preguntas.filter((p) => p.estado === "respondida").length ?? 0;
   const total = detalle?.preguntas.length ?? 0;
   const ocupado = trabajo?.estado === "en_curso";
+  const interruptorWord = wordDisponible && (
+    <label className="interruptor">
+      <input type="checkbox" checked={revisarWord} onChange={(e) => setRevisarWord(e.target.checked)} />
+      <span className="pista" />
+      <span>Revisar con Microsoft Word<small>Índice con páginas y PDF de la nueva versión.</small></span>
+    </label>
+  );
+  const faltaAvance = !archivoAvance || !clienteAvance.trim() || !codigoAvance.trim();
   const proyectos = agrupar(lista);
   const visibles = proyectos.filter((p) => !filtro || `${p.codigo} ${p.cliente} ${p.principal.titulo}`.toLowerCase().includes(filtro.toLowerCase()));
   const proyecto = proyectos.find((p) => p.registros.some((r) => r.id === seleccion));
@@ -177,6 +235,9 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
           <h2>Proyectos</h2>
           <span>{proyectos.length} · {lista.length} versiones</span>
         </div>
+        <button type="button" className="boton ancho" disabled={ocupado} onClick={() => { setImportando(true); setTrabajo(null); }}>
+          <Icono n="upload" size={15} /> Importar proyecto en avance
+        </button>
         <div className="entrada-icono buscador">
           <Icono n="eye" size={14} />
           <input value={filtro} onChange={(e) => setFiltro(e.target.value)} placeholder="Buscar por código, cliente o título" />
@@ -215,7 +276,7 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
             );
           })}
         </ul>
-        {!lista.length && <p className="vacio">Aún no hay RFD. Genere uno en la pestaña «Generar».</p>}
+        {!lista.length && <p className="vacio">Aún no hay RFD. Genere uno en la pestaña «Generar» o importe uno en avance.</p>}
         {lista.length > 0 && !visibles.length && <p className="vacio">Ningún proyecto coincide con la búsqueda.</p>}
       </aside>
 
@@ -225,7 +286,7 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
           <>
             <div className="panel cabecera-rfd">
               <div>
-                <small>{detalle.codigo} · {detalle.cliente} · {nombres.get(detalle.id) ?? `v${detalle.version}`} · {detalle.origen}{detalle.modelo ? ` con ${detalle.modelo}` : ""}</small>
+                <small>{detalle.codigo} · {detalle.cliente} · {nombres.get(detalle.id) ?? `v${detalle.version}`} · {ORIGEN[detalle.origen] ?? detalle.origen}{detalle.modelo ? ` con ${detalle.modelo}` : ""}</small>
                 <h2>{detalle.titulo}</h2>
                 <p>{detalle.objetivo}</p>
               </div>
@@ -233,6 +294,7 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
                 {detalle.archivos.docx && <a className="boton" href={api.archivoRfd(detalle.id, "docx")}><Icono n="download" size={15} /> Word</a>}
                 {detalle.archivos.pdf && <button type="button" className="boton" onClick={() => api.abrirRfd(detalle.id, "pdf")}><Icono n="doc" size={15} /> PDF</button>}
                 {detalle.archivos.cuestionario && <a className="boton" href={api.archivoRfd(detalle.id, "cuestionario")}><Icono n="download" size={15} /> Cuestionario</a>}
+                {detalle.archivos.prototipo && <a className="boton" href={api.archivoRfd(detalle.id, "prototipo")} target="_blank" rel="noreferrer"><Icono n="eye" size={15} /> Prototipo</a>}
                 <button type="button" className="boton fantasma" onClick={() => api.abrirRfd(detalle.id, "carpeta")}><Icono n="folder" size={15} /></button>
               </div>
               {detalle.archivos.docx && <EnviarEstimador key={detalle.id} rfdId={detalle.id} codigo={detalle.codigo} version={detalle.version} />}
@@ -304,7 +366,61 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
           {trabajo?.estado === "listo" && trabajo.resultado ? (
             <ResultadoVista trabajo={trabajo} onNuevo={() => { setTrabajo(null); if (trabajo.resultado?.rfd_id) setSeleccion(trabajo.resultado.rfd_id); }}
               textoNuevo="Ver la nueva versión" />
+          ) : importando ? (
+            <>
+              <h2 className="panel-titulo"><Icono n="upload" size={16} /> Importar proyecto en avance</h2>
+              <p className="campo-ayuda">
+                Cargue el Word de un RFD a medio redactar. Queda en el historial como «en avance», con su archivo original enlazado,
+                para continuarlo después sin perder nada de lo ya escrito.
+              </p>
+              <ZonaArchivos titulo="RFD en avance" descripcion="Un archivo .docx" archivos={archivoAvance ? [archivoAvance] : []}
+                aceptar={[".docx"]} onCambio={(a) => setArchivoAvance(a[a.length - 1] ?? null)} />
+              <div className="rejilla-1">
+                <Campo etiqueta="Cliente *"><input value={clienteAvance} onChange={(e) => setClienteAvance(e.target.value)} placeholder="Nombre del cliente" /></Campo>
+                <Campo etiqueta="Código RFD *"><input value={codigoAvance} onChange={(e) => setCodigoAvance(e.target.value)} placeholder="RFD-001" /></Campo>
+                <Campo etiqueta="Título" ayuda="Opcional; si se deja vacío se toma del documento."><input value={tituloAvance} onChange={(e) => setTituloAvance(e.target.value)} /></Campo>
+              </div>
+              {motor.vista}
+              {trabajo && <Progreso trabajo={trabajo} conCodigo={false} conWord={false} pasos={pasosDe(trabajo)} />}
+              <button type="button" className="boton primario grande" disabled={ocupado || faltaAvance || !motor.listo} onClick={importar}>
+                {ocupado ? <><span className="girando claro" /> Importando…</> : <><Icono n="upload" size={18} /> Importar al historial</>}
+              </button>
+              {!ocupado && faltaAvance && <p className="falta">Indique el Word en avance, el cliente y el código.</p>}
+              <button type="button" className="boton fantasma ancho" disabled={ocupado} onClick={() => { setImportando(false); setTrabajo(null); }}>Volver al historial</button>
+            </>
           ) : (
+            <>
+              <Segmentado valor={modo} onCambio={setModo} opciones={[
+                { valor: "continuar", etiqueta: "Continuar", detalle: "completar" },
+                { valor: "mejorar", etiqueta: "Mejorar", detalle: "con respuestas" },
+                { valor: "prototipo", etiqueta: "Prototipo", detalle: "UI" },
+              ]} />
+              {modo === "prototipo" ? (
+                detalle ? <PanelPrototipo rfd={detalle} motor={motor} /> : <p className="vacio">Seleccione un RFD.</p>
+              ) : modo === "continuar" ? (
+                <>
+                  <h2 className="panel-titulo"><Icono n="play" size={16} /> Continuar RFD</h2>
+                  <p className="campo-ayuda">
+                    La IA conserva lo ya escrito y sólo completa lo que falta: secciones vacías, marcadores y «por confirmar». No necesita
+                    respuestas del cliente; crea la versión {detalle ? siguiente(detalle.version) : "siguiente"} y la anterior queda intacta.
+                  </p>
+                  <ZonaArchivos titulo="Contexto adicional" descripcion="Opcional · transcripciones, especificaciones, correos" archivos={contexto}
+                    aceptar={EXTENSIONES} onCambio={setContexto} />
+                  <Campo etiqueta="¿Qué falta o en qué enfocarte?" ayuda="Opcional. Ej.: «completa los criterios de RF-03 y el esfuerzo»." ancho>
+                    <textarea value={instruccion} onChange={(e) => setInstruccion(e.target.value)} rows={3} />
+                  </Campo>
+                  {motor.vista}
+                  {interruptorWord}
+                  <ul className="lista-control">
+                    <li className={contexto.length ? "ok" : ""}><Icono n="check" size={14} />{contexto.length} documento(s) de contexto</li>
+                    <li className={instruccion.trim() ? "ok" : ""}><Icono n="check" size={14} />{instruccion.trim() ? "Con instrucción" : "Sin instrucción"}</li>
+                  </ul>
+                  {trabajo && <Progreso trabajo={trabajo} conCodigo={false} conWord={revisarWord && wordDisponible} pasos={pasosDe(trabajo)} />}
+                  <button type="button" className="boton primario grande" disabled={!detalle || ocupado || !motor.listo} onClick={() => lanzar("continuar")}>
+                    {ocupado ? <><span className="girando claro" /> Procesando…</> : <><Icono n="spark" size={18} /> Continuar a v{detalle ? siguiente(detalle.version) : ""}</>}
+                  </button>
+                </>
+              ) : (
             <>
               <h2 className="panel-titulo"><Icono n="refresh" size={16} /> Mejorar RFD</h2>
               <p className="campo-ayuda">
@@ -314,19 +430,12 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
               <ZonaArchivos titulo="Documentos del cliente" descripcion="Opcional · actas, correos, aclaraciones" archivos={adjuntos}
                 aceptar={EXTENSIONES} onCambio={setAdjuntos} />
               {motor.vista}
-              {wordDisponible && (
-                <label className="interruptor">
-                  <input type="checkbox" checked={revisarWord} onChange={(e) => setRevisarWord(e.target.checked)} />
-                  <span className="pista" />
-                  <span>Revisar con Microsoft Word<small>Índice con páginas y PDF de la nueva versión.</small></span>
-                </label>
-              )}
+              {interruptorWord}
               <ul className="lista-control">
                 <li className={respondidas ? "ok" : ""}><Icono n="check" size={14} />{respondidas} respuesta(s) guardada(s)</li>
                 <li className={adjuntos.length ? "ok" : ""}><Icono n="check" size={14} />{adjuntos.length} documento(s) del cliente</li>
               </ul>
-              {trabajo && <Progreso trabajo={trabajo} conCodigo={false} conWord={revisarWord && wordDisponible}
-                pasos={trabajo.tipo === "preguntas" ? undefined : PASOS_MEJORA} />}
+              {trabajo && <Progreso trabajo={trabajo} conCodigo={false} conWord={revisarWord && wordDisponible} pasos={pasosDe(trabajo)} />}
               <button type="button" className="boton primario grande" disabled={!detalle || ocupado || (!respondidas && !adjuntos.length) || !motor.listo}
                 onClick={() => lanzar("mejora")}>
                 {ocupado ? <><span className="girando claro" /> Procesando…</> : <><Icono n="spark" size={18} /> Mejorar a v{detalle ? siguiente(detalle.version) : ""}</>}
@@ -334,6 +443,8 @@ export function Historial({ motor, wordDisponible, seleccionInicial }: {
               {!ocupado && detalle && !respondidas && !adjuntos.length && <p className="falta">Responda al menos una pregunta o adjunte un documento del cliente.</p>}
               {detalle && proyecto && detalle.id !== proyecto.principal.id && (
                 <p className="campo-ayuda">Está viendo {nombres.get(detalle.id)}; la versión actual del proyecto es v{proyecto.principal.version}. Mejorar desde aquí crea otra rama.</p>
+              )}
+            </>
               )}
             </>
           )}

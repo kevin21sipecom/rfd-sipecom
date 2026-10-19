@@ -29,6 +29,7 @@ export default function App() {
   const [rfdElegido, setRfdElegido] = useState<number | null>(null);
   const [publico, setPublico] = useState(false);
   const [estilos, setEstilos] = useState<File[]>([]);
+  const [avances, setAvances] = useState<File[]>([]);
   const [revisarWord, setRevisarWord] = useState(true);
   const [trabajo, setTrabajo] = useState<Trabajo | null>(null);
   const [error, setError] = useState("");
@@ -70,7 +71,7 @@ export default function App() {
   }, [proyecto, enfoque, titulo]);
 
   const faltantes = [
-    !transcripciones.length && !contextos.length && "al menos un archivo",
+    !transcripciones.length && !contextos.length && !avances.length && "al menos un archivo",
     !cliente.trim() && "el cliente",
     !codigo.trim() && "el código",
     !motor.listo && "un motor disponible",
@@ -83,6 +84,7 @@ export default function App() {
     transcripciones.forEach((a) => f.append("transcripciones", a));
     contextos.forEach((a) => f.append("contextos", a));
     estilos.forEach((a) => f.append("estilos", a));
+    avances.forEach((a) => f.append("avances", a));
     Object.entries({ cliente, codigo, titulo, fecha, proyecto, enfoque, tipo_proyecto: tipo })
       .forEach(([k, v]) => f.append(k, v));
     motor.agregar(f);
@@ -146,6 +148,11 @@ export default function App() {
                 aceptar={EXTENSIONES} onCambio={setTranscripciones} />
               <ZonaArchivos titulo="Contexto del proyecto" descripcion="Documentos y presentaciones" archivos={contextos}
                 aceptar={EXTENSIONES} onCambio={setContextos} />
+            </div>
+            <div className="bloque-estilo">
+              <ZonaArchivos titulo="RFD en avance" descripcion="Opcional · trabajo previo que la IA debe continuar" archivos={avances}
+                aceptar={EXTENSIONES} onCambio={setAvances} />
+              <p className="campo-ayuda">Se conserva lo ya redactado, se completa lo que falta y se imita la forma de trabajar del autor. Si contradice otras fuentes, queda registrado en «definiciones».</p>
             </div>
             <div className="bloque-estilo">
               <ZonaArchivos titulo="Referencias de estilo" descripcion="Opcional · RFD aprobados de otros proyectos" archivos={estilos}
@@ -219,6 +226,7 @@ export default function App() {
                 <ul className="lista-control">
                   <li className={transcripciones.length ? "ok" : ""}><Icono n="check" size={14} />{transcripciones.length ? `${transcripciones.length} transcripción(es)` : "Sin transcripción (opcional)"}</li>
                   <li className={contextos.length ? "ok" : ""}><Icono n="check" size={14} />{contextos.length} documento(s) de contexto</li>
+                  <li className={avances.length ? "ok" : ""}><Icono n="check" size={14} />{avances.length ? `${avances.length} RFD en avance a continuar` : "Sin RFD en avance (opcional)"}</li>
                   <li className={estilos.length ? "ok" : ""}><Icono n="check" size={14} />{estilos.length ? `${estilos.length} referencia(s) de estilo` : "Sin referencia de estilo (opcional)"}</li>
                   <li className={proyecto.trim() ? "ok" : ""}><Icono n="check" size={14} />{proyecto.trim() ? "Código del proyecto incluido" : "Sin código del proyecto"}</li>
                   <li className={cliente && codigo ? "ok" : ""}><Icono n="check" size={14} />Cliente y código</li>
